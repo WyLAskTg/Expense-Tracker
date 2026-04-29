@@ -1,2 +1,3 @@
-print("Expense Tracker")
-print("Welcome!")
+from app import root
+
+root.mainloop()
