@@ -13,7 +13,7 @@ records = []
 top_frame = tk.Frame(root, padx=15, pady=10)
 top_frame.pack(fill="x")
 
-version = tk.Label(top_frame, text="Expense Tracker 0.9")
+version = tk.Label(top_frame, text="Expense Tracker v26.4")
 version.pack(anchor="w")
 
 status = tk.Label(top_frame, text="Add your first record")
