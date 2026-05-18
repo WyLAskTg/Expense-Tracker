@@ -15,6 +15,7 @@ A desktop expense tracker built with Python, Tkinter, and SQLite.
 - Export the current record view to CSV
 - Import records from CSV with preview and duplicate detection
 - Switch the app language between English, Chinese, French, and Japanese
+- Choose a display currency for all money amounts
 - Back up and restore the local SQLite database
 - Persist data with SQLite
 
@@ -56,7 +57,21 @@ If an older project-local `expense_tracker.db` exists, the app copies it into th
 - `Reports`: Review spending by category and compare income vs. expense over time.
 - `Budgets`: Set monthly category budgets and track remaining budget.
 - `Categories`: Add, rename, color-code, and remove unused categories.
-- `Tools`: Back up, restore, or open the local data folder.
+- `Tools`: Change settings, back up, restore, or open the local data folder.
+
+## App Icon
+
+The source icon image lives at:
+
+```text
+assets/icon-source.jpg
+```
+
+The Windows icon used by Tkinter, PyInstaller, and the installer lives at:
+
+```text
+assets/app.ico
+```
 
 ## CSV Import
 
@@ -80,4 +95,4 @@ py -3 -m unittest discover -s tests
 
 ## Automated Builds
 
-GitHub Actions builds a Windows executable on pushes to `main`, pull requests, and manual workflow runs. Tag a commit with a version like `v26.5.1` to create a GitHub Release with the built `.exe`.
+GitHub Actions builds a Windows executable and an Inno Setup installer on pushes to `main`, pull requests, and manual workflow runs. Tag a commit with a version like `v26.5.2` to create a GitHub Release with both assets.

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from record_utils import (
     amount_to_cents,
+    money_text,
     parse_csv_records,
     parse_month,
     parse_record_date,
@@ -15,6 +16,10 @@ class RecordUtilsTest(unittest.TestCase):
     def test_amount_to_cents_rounds_half_up(self):
         self.assertEqual(amount_to_cents("12.345"), 1235)
         self.assertEqual(amount_to_cents("1,000.00"), 100000)
+
+    def test_money_text_uses_currency_symbol(self):
+        self.assertEqual(money_text(1234, "¥"), "¥12.34")
+        self.assertEqual(money_text(-1234, "€"), "-€12.34")
 
     def test_date_and_month_parsing(self):
         self.assertEqual(parse_record_date("2026-05-18"), "2026-05-18")

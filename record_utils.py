@@ -47,11 +47,11 @@ def parse_month(raw_month):
     return raw_month
 
 
-def money_text(cents):
+def money_text(cents, currency_symbol="$"):
     cents = int(cents or 0)
     sign = "-" if cents < 0 else ""
     cents = abs(cents)
-    return f"{sign}${cents // 100}.{cents % 100:02d}"
+    return f"{sign}{currency_symbol}{cents // 100}.{cents % 100:02d}"
 
 
 def amount_entry_text(cents):

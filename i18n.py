@@ -66,6 +66,8 @@ TRANSLATIONS = {
     "backup_database": {"en": "Backup Database", "zh": "备份数据库", "fr": "Sauvegarder", "ja": "バックアップ"},
     "restore_database": {"en": "Restore Database", "zh": "恢复数据库", "fr": "Restaurer", "ja": "復元"},
     "open_data_folder": {"en": "Open Data Folder", "zh": "打开数据目录", "fr": "Ouvrir le dossier", "ja": "フォルダを開く"},
+    "settings": {"en": "Settings", "zh": "设置", "fr": "Paramètres", "ja": "設定"},
+    "currency": {"en": "Currency", "zh": "货币", "fr": "Devise", "ja": "通貨"},
     "ready": {"en": "Ready.", "zh": "准备就绪。", "fr": "Prêt.", "ja": "準備完了。"},
     "form_cleared": {"en": "Form cleared.", "zh": "表单已清空。", "fr": "Formulaire effacé.", "ja": "フォームをクリアしました。"},
     "nothing_to_save": {"en": "Nothing to save on this tab.", "zh": "当前页没有可保存内容。", "fr": "Rien à enregistrer ici.", "ja": "このタブに保存する内容はありません。"},

@@ -37,21 +37,27 @@ jobs:
         run: python -m unittest discover -s tests
 
       - name: Build executable
-        run: pyinstaller --noconfirm --clean --onefile --windowed --name "Expense Tracker" main.py
+        run: pyinstaller --noconfirm --clean --onefile --windowed --icon assets/app.ico --add-data "assets/app.ico;assets" --name "Expense Tracker" main.py
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "installer\expense-tracker.iss"'
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: Expense-Tracker-Windows
-          path: dist/Expense Tracker.exe
+          path: |
+            dist/Expense Tracker.exe
+            dist/Expense-Tracker-Setup-*.exe
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
-        run: >
-          gh release create "$env:TAG_NAME"
-          "dist/Expense Tracker.exe"
-          --title "Expense Tracker $env:TAG_NAME"
-          --notes "Automated Windows build."
+        run: |
+          $installer = Get-Item "dist\Expense-Tracker-Setup-*.exe"
+          gh release create "$env:TAG_NAME" "dist/Expense Tracker.exe" $installer.FullName --title "Expense Tracker $env:TAG_NAME" --notes "Automated Windows build with single-file EXE and installer."

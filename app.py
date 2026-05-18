@@ -1,7 +1,9 @@
 import csv
 import os
+import sys
 import tkinter as tk
 from datetime import date
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from database import (
@@ -41,6 +43,19 @@ from record_utils import (
 
 CURRENT_MONTH = date.today().strftime("%Y-%m")
 DEFAULT_LANGUAGE = "en"
+APP_VERSION = "v26.5.2"
+APP_ICON = "assets/app.ico"
+CURRENCY_OPTIONS = {
+    "USD": "$",
+    "CNY": "\u00a5",
+    "EUR": "\u20ac",
+    "GBP": "\u00a3",
+    "JPY": "\u00a5",
+}
+
+def resource_path(relative_path):
+    base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base_path / relative_path
 
 
 class ExpenseTrackerApp:
@@ -58,10 +73,15 @@ class ExpenseTrackerApp:
         self.language_code = get_setting("language", DEFAULT_LANGUAGE)
         if self.language_code not in LANGUAGES:
             self.language_code = DEFAULT_LANGUAGE
+        self.currency_code = get_setting("currency", "USD")
+        if self.currency_code not in CURRENCY_OPTIONS:
+            self.currency_code = "USD"
+        self.currency_symbol = CURRENCY_OPTIONS[self.currency_code]
 
         self.root.title(self.t("app_title"))
         self.root.geometry("1120x760")
         self.root.minsize(980, 680)
+        self.set_window_icon()
 
         self.build_ui()
         self.bind_shortcuts()
@@ -69,6 +89,17 @@ class ExpenseTrackerApp:
 
     def t(self, key, **kwargs):
         return translate(self.language_code, key, **kwargs)
+
+    def money_text(self, cents):
+        return money_text(cents, self.currency_symbol)
+
+    def set_window_icon(self):
+        icon_path = resource_path(APP_ICON)
+        if icon_path.exists():
+            try:
+                self.root.iconbitmap(default=str(icon_path))
+            except tk.TclError:
+                pass
 
     def build_ui(self):
         self.style = ttk.Style()
@@ -122,7 +153,7 @@ class ExpenseTrackerApp:
         language_combo.grid(row=0, column=2, sticky="e", padx=(0, 12))
         language_combo.bind("<<ComboboxSelected>>", self.change_language)
 
-        self.version_label = ttk.Label(header, text="v26.5.1")
+        self.version_label = ttk.Label(header, text=APP_VERSION)
         self.version_label.grid(row=0, column=3, sticky="e")
 
     def change_language(self, event=None):
@@ -136,6 +167,20 @@ class ExpenseTrackerApp:
             child.destroy()
         self.build_ui()
         self.bind_shortcuts()
+        self.refresh_all(self.t("ready"))
+
+    def change_language_from_settings(self, event=None):
+        self.language_var.set(self.settings_language_var.get())
+        self.change_language()
+
+    def change_currency(self, event=None):
+        new_currency = self.currency_var.get()
+        if new_currency not in CURRENCY_OPTIONS or new_currency == self.currency_code:
+            return
+
+        self.currency_code = new_currency
+        self.currency_symbol = CURRENCY_OPTIONS[new_currency]
+        set_setting("currency", new_currency)
         self.refresh_all(self.t("ready"))
 
     def build_records_tab(self):
@@ -475,8 +520,38 @@ class ExpenseTrackerApp:
     def build_tools_tab(self):
         self.tools_tab.columnconfigure(0, weight=1)
 
+        settings_frame = ttk.LabelFrame(self.tools_tab, text=self.t("settings"), padding=12)
+        settings_frame.grid(row=0, column=0, padx=10, pady=(10, 8), sticky="ew")
+        settings_frame.columnconfigure(1, weight=1)
+        settings_frame.columnconfigure(3, weight=1)
+
+        self.settings_language_var = tk.StringVar(value=self.language_code)
+        self.currency_var = tk.StringVar(value=self.currency_code)
+
+        ttk.Label(settings_frame, text=self.t("language")).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        settings_language_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self.settings_language_var,
+            values=list(LANGUAGES.keys()),
+            state="readonly",
+            width=10,
+        )
+        settings_language_combo.grid(row=0, column=1, sticky="w", padx=(0, 20))
+        settings_language_combo.bind("<<ComboboxSelected>>", self.change_language_from_settings)
+
+        ttk.Label(settings_frame, text=self.t("currency")).grid(row=0, column=2, sticky="w", padx=(0, 8))
+        currency_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self.currency_var,
+            values=list(CURRENCY_OPTIONS.keys()),
+            state="readonly",
+            width=10,
+        )
+        currency_combo.grid(row=0, column=3, sticky="w")
+        currency_combo.bind("<<ComboboxSelected>>", self.change_currency)
+
         data_frame = ttk.LabelFrame(self.tools_tab, text=self.t("data"), padding=12)
-        data_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        data_frame.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="ew")
         data_frame.columnconfigure(1, weight=1)
 
         self.db_path_var = tk.StringVar(value=str(get_db_path()))
@@ -574,7 +649,7 @@ class ExpenseTrackerApp:
             self.tree.delete(item)
 
         for record in self.records:
-            amount = money_text(record["amount_cents"])
+            amount = self.money_text(record["amount_cents"])
             if record["type"] == "expense":
                 amount = f"-{amount}"
             else:
@@ -601,9 +676,9 @@ class ExpenseTrackerApp:
         )
         balance = income - expense
 
-        self.total_expense_var.set(f"{self.t('expense')}: {money_text(expense)}")
-        self.total_income_var.set(f"{self.t('income')}: {money_text(income)}")
-        self.balance_var.set(f"{self.t('balance')}: {money_text(balance)}")
+        self.total_expense_var.set(f"{self.t('expense')}: {self.money_text(expense)}")
+        self.total_income_var.set(f"{self.t('income')}: {self.money_text(income)}")
+        self.balance_var.set(f"{self.t('balance')}: {self.money_text(balance)}")
         self.count_var.set(f"{self.t('count')}: {len(self.records)}")
 
     def selected_record(self):
@@ -694,7 +769,7 @@ class ExpenseTrackerApp:
 
         confirmed = messagebox.askyesno(
             "Delete record",
-            f"Delete {record['category']} {money_text(record['amount_cents'])} on {record['date']}?",
+            f"Delete {record['category']} {self.money_text(record['amount_cents'])} on {record['date']}?",
         )
         if not confirmed:
             self.set_status("Delete cancelled.")
@@ -864,7 +939,7 @@ class ExpenseTrackerApp:
                     record["date"],
                     self.type_text(record["type"]),
                     record["category"],
-                    money_text(record["amount_cents"]),
+                    self.money_text(record["amount_cents"]),
                     record["note"],
                 ),
             )
@@ -884,14 +959,14 @@ class ExpenseTrackerApp:
         self.category_chart_data = load_category_spending(month=month)
         self.monthly_chart_data = load_monthly_summary(limit=12)
 
-        self.report_income_var.set(f"{self.t('income')}: {money_text(income)}")
-        self.report_expense_var.set(f"{self.t('expense')}: {money_text(expense)}")
-        self.report_balance_var.set(f"{self.t('balance')}: {money_text(balance)}")
+        self.report_income_var.set(f"{self.t('income')}: {self.money_text(income)}")
+        self.report_expense_var.set(f"{self.t('expense')}: {self.money_text(expense)}")
+        self.report_balance_var.set(f"{self.t('balance')}: {self.money_text(balance)}")
 
         if self.category_chart_data:
             top = self.category_chart_data[0]
             self.report_top_category_var.set(
-                f"{self.t('top_category')}: {top['category']} ({money_text(top['spent_cents'])})"
+                f"{self.t('top_category')}: {top['category']} ({self.money_text(top['spent_cents'])})"
             )
         else:
             self.report_top_category_var.set(f"{self.t('top_category')}: -")
@@ -930,7 +1005,7 @@ class ExpenseTrackerApp:
             color = row.get("color") or colors[index % len(colors)]
             canvas.create_text(16, y + 10, anchor="w", text=row["category"], fill="#24292f")
             canvas.create_rectangle(left, y, left + length, y + 18, fill=color, outline="")
-            canvas.create_text(left + length + 8, y + 9, anchor="w", text=money_text(value), fill="#57606a")
+            canvas.create_text(left + length + 8, y + 9, anchor="w", text=self.money_text(value), fill="#57606a")
 
     def draw_trend_chart(self):
         canvas = self.trend_canvas
@@ -957,7 +1032,7 @@ class ExpenseTrackerApp:
         slot = chart_width / max(len(rows), 1)
 
         canvas.create_line(left, top + chart_height, width - right, top + chart_height, fill="#d0d7de")
-        canvas.create_text(left, top - 8, anchor="w", text=money_text(max_value), fill="#57606a")
+        canvas.create_text(left, top - 8, anchor="w", text=self.money_text(max_value), fill="#57606a")
         canvas.create_text(width - right - 140, 18, anchor="w", text=self.t("income"), fill="#18794e")
         canvas.create_rectangle(width - right - 160, 12, width - right - 146, 24, fill="#18794e", outline="")
         canvas.create_text(width - right - 68, 18, anchor="w", text=self.t("expense"), fill="#b42318")
@@ -1056,9 +1131,9 @@ class ExpenseTrackerApp:
                 iid=str(budget["id"]),
                 values=(
                     budget["category"],
-                    money_text(budget["amount_cents"]),
-                    money_text(spent),
-                    money_text(remaining),
+                    self.money_text(budget["amount_cents"]),
+                    self.money_text(spent),
+                    self.money_text(remaining),
                     f"{usage * 100:.0f}%",
                 ),
                 tags=(tag,),
@@ -1066,8 +1141,8 @@ class ExpenseTrackerApp:
 
         if self.budgets:
             self.budget_summary_var.set(
-                f"{month}: {self.t('spent')} {money_text(total_spent)} / "
-                f"{self.t('budget')} {money_text(total_budget)}; {over_count} over."
+                f"{month}: {self.t('spent')} {self.money_text(total_spent)} / "
+                f"{self.t('budget')} {self.money_text(total_budget)}; {over_count} over."
             )
         else:
             self.budget_summary_var.set(f"{self.t('budgets')}: 0 ({month})")
@@ -1148,7 +1223,7 @@ class ExpenseTrackerApp:
                 values=(
                     category["name"],
                     category["color"],
-                    money_text(category["default_budget_cents"]),
+                    self.money_text(category["default_budget_cents"]),
                     category["record_count"],
                     category["budget_count"],
                 ),
