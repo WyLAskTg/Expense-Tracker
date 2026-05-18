@@ -9,7 +9,10 @@ A desktop expense tracker built with Python, Tkinter, and SQLite.
 - Edit and delete existing records
 - Filter records by month, category, and search text
 - Display income, expense, balance, and record count summaries
+- View reports with category spending and 12-month trend charts
+- Set monthly budgets by category and compare budget vs. actual spending
 - Export the current record view to CSV
+- Back up and restore the local SQLite database
 - Persist data with SQLite
 
 ## Tech Stack
@@ -43,3 +46,10 @@ The app stores records in `expense_tracker.db`. On Windows, new app data is save
 ```
 
 If an older project-local `expense_tracker.db` exists, the app copies it into the app data folder the first time it starts.
+
+## App Tabs
+
+- `Records`: Add, edit, delete, filter, and export transactions.
+- `Reports`: Review spending by category and compare income vs. expense over time.
+- `Budgets`: Set monthly category budgets and track remaining budget.
+- `Tools`: Back up, restore, or open the local data folder.

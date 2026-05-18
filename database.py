@@ -117,8 +117,22 @@ def database_init():
             """
         )
         _migrate_records_table(cursor)
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS Budgets(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                month TEXT NOT NULL,
+                category TEXT NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(month, category)
+            )
+            """
+        )
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_date ON Records(date)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_category ON Records(category)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_budgets_month ON Budgets(month)")
         db.commit()
 
 
@@ -230,9 +244,172 @@ def get_categories():
         return [row["category"] for row in cursor.fetchall()]
 
 
+def get_months():
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute(
+            """
+            SELECT month
+            FROM (
+                SELECT DISTINCT SUBSTR(date, 1, 7) AS month
+                FROM Records
+                WHERE date IS NOT NULL AND date != ''
+
+                UNION
+
+                SELECT DISTINCT month
+                FROM Budgets
+                WHERE month IS NOT NULL AND month != ''
+            )
+            ORDER BY month DESC
+            """
+        )
+        return [row["month"] for row in cursor.fetchall()]
+
+
+def load_monthly_summary(limit=12):
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute(
+            """
+            SELECT
+                SUBSTR(date, 1, 7) AS month,
+                SUM(CASE WHEN type = 'income' THEN amount_cents ELSE 0 END) AS income_cents,
+                SUM(CASE WHEN type = 'expense' THEN amount_cents ELSE 0 END) AS expense_cents
+            FROM Records
+            GROUP BY SUBSTR(date, 1, 7)
+            ORDER BY month DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = [dict(row) for row in cursor.fetchall()]
+        rows.reverse()
+        return rows
+
+
+def load_category_spending(month=None):
+    clauses = ["type = 'expense'"]
+    params = []
+
+    if month:
+        clauses.append("date LIKE ?")
+        params.append(f"{month}-%")
+
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute(
+            f"""
+            SELECT category, SUM(amount_cents) AS spent_cents
+            FROM Records
+            WHERE {' AND '.join(clauses)}
+            GROUP BY category
+            ORDER BY spent_cents DESC, category COLLATE NOCASE
+            """,
+            params,
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def load_budgets(month=None):
+    clauses = []
+    params = []
+
+    if month:
+        clauses.append("month = ?")
+        params.append(month)
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute(
+            f"""
+            SELECT id, month, category, amount_cents, created_at, updated_at
+            FROM Budgets
+            {where}
+            ORDER BY month DESC, category COLLATE NOCASE
+            """,
+            params,
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def upsert_budget(month, category, amount_cents):
+    now = _now()
+
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute(
+            """
+            INSERT INTO Budgets (month, category, amount_cents, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(month, category)
+            DO UPDATE SET
+                amount_cents = excluded.amount_cents,
+                updated_at = excluded.updated_at
+            """,
+            (month, category, amount_cents, now, now),
+        )
+        db.commit()
+        cursor.execute(
+            "SELECT id FROM Budgets WHERE month = ? AND category = ?",
+            (month, category),
+        )
+        return cursor.fetchone()["id"]
+
+
+def delete_budget(budget_id):
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM Budgets WHERE id = ?", (budget_id,))
+        db.commit()
+        return cursor.rowcount
+
+
 def delete_record(record_id):
     with _connect() as db:
         cursor = db.cursor()
         cursor.execute("DELETE FROM Records WHERE id = ?", (record_id,))
         db.commit()
         return cursor.rowcount
+
+
+def backup_database(destination_path):
+    database_init()
+    destination = Path(destination_path).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(get_db_path(), destination)
+    return destination
+
+
+def validate_database_file(source_path):
+    source = Path(source_path).expanduser().resolve()
+    if not source.exists():
+        raise FileNotFoundError(source)
+
+    try:
+        db = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+        try:
+            cursor = db.cursor()
+            cursor.execute("PRAGMA integrity_check")
+            result = cursor.fetchone()[0]
+            if result != "ok":
+                raise ValueError(f"Database integrity check failed: {result}")
+            cursor.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'Records'")
+            if cursor.fetchone() is None:
+                raise ValueError("Backup does not contain a Records table.")
+        finally:
+            db.close()
+    except sqlite3.DatabaseError as exc:
+        raise ValueError("Selected file is not a valid SQLite database.") from exc
+
+    return source
+
+
+def restore_database(source_path):
+    source = validate_database_file(source_path)
+    destination = get_db_path()
+    shutil.copy2(source, destination)
+    database_init()
+    return destination
