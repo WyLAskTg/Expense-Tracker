@@ -13,7 +13,8 @@ A desktop expense tracker built with Python, Tkinter, and SQLite.
 - Set monthly budgets by category and compare budget vs. actual spending
 - Manage categories with colors and default monthly budgets
 - Export the current record view to CSV
-- Import records from CSV
+- Import records from CSV with preview and duplicate detection
+- Switch the app language between English, Chinese, French, and Japanese
 - Back up and restore the local SQLite database
 - Persist data with SQLite
 
@@ -67,6 +68,16 @@ date,type,category,amount,note
 
 The `note` column is optional. Dates must use `YYYY-MM-DD`, and `type` must be `income` or `expense`.
 
+Before importing, the app previews new records and skips duplicate records that match an existing or already-previewed record by date, type, category, and amount.
+
+## Tests
+
+Run the local test suite with:
+
+```bash
+py -3 -m unittest discover -s tests
+```
+
 ## Automated Builds
 
-GitHub Actions builds a Windows executable on pushes to `main`, pull requests, and manual workflow runs. Tag a commit with a version like `v1.0.0` to create a GitHub Release with the built `.exe`.
+GitHub Actions builds a Windows executable on pushes to `main`, pull requests, and manual workflow runs. Tag a commit with a version like `v26.5.1` to create a GitHub Release with the built `.exe`.

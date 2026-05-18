@@ -1,8 +1,7 @@
 import csv
 import os
 import tkinter as tk
-from datetime import date, datetime
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from datetime import date
 from tkinter import filedialog, messagebox, ttk
 
 from database import (
@@ -14,6 +13,7 @@ from database import (
     get_categories,
     get_db_path,
     get_months,
+    get_setting,
     insert_record,
     load_budgets,
     load_categories,
@@ -22,66 +22,25 @@ from database import (
     load_records,
     restore_database,
     save_category,
+    set_setting,
     update_record,
     upsert_budget,
 )
+from i18n import LANGUAGES, translate
+from record_utils import (
+    TYPE_OPTIONS,
+    amount_entry_text,
+    amount_to_cents,
+    money_text,
+    parse_csv_records,
+    parse_month,
+    parse_record_date,
+    split_new_and_duplicate_records,
+)
 
 
-MONEY_QUANT = Decimal("1")
-TYPE_OPTIONS = ("expense", "income")
 CURRENT_MONTH = date.today().strftime("%Y-%m")
-
-
-def amount_to_cents(raw_amount):
-    raw_amount = raw_amount.strip().replace(",", "")
-    if not raw_amount:
-        raise ValueError("Amount must be non-empty.")
-
-    try:
-        amount = Decimal(raw_amount)
-    except InvalidOperation as exc:
-        raise ValueError("Amount must be a valid number.") from exc
-
-    if amount <= 0:
-        raise ValueError("Amount must be positive.")
-
-    return int((amount * 100).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP))
-
-
-def parse_record_date(raw_date):
-    raw_date = raw_date.strip()
-    if not raw_date:
-        raise ValueError("Date must be non-empty.")
-
-    try:
-        return datetime.strptime(raw_date, "%Y-%m-%d").date().isoformat()
-    except ValueError as exc:
-        raise ValueError("Date must use YYYY-MM-DD format.") from exc
-
-
-def parse_month(raw_month):
-    raw_month = raw_month.strip()
-    if not raw_month:
-        return None
-
-    try:
-        datetime.strptime(raw_month, "%Y-%m")
-    except ValueError as exc:
-        raise ValueError("Month must use YYYY-MM format.") from exc
-
-    return raw_month
-
-
-def money_text(cents):
-    cents = int(cents or 0)
-    sign = "-" if cents < 0 else ""
-    cents = abs(cents)
-    return f"{sign}${cents // 100}.{cents % 100:02d}"
-
-
-def amount_entry_text(cents):
-    cents = abs(int(cents or 0))
-    return f"{cents // 100}.{cents % 100:02d}"
+DEFAULT_LANGUAGE = "en"
 
 
 class ExpenseTrackerApp:
@@ -95,14 +54,21 @@ class ExpenseTrackerApp:
         self.editing_record_id = None
         self.editing_category_id = None
 
-        self.root.title("Expense Tracker")
+        database_init()
+        self.language_code = get_setting("language", DEFAULT_LANGUAGE)
+        if self.language_code not in LANGUAGES:
+            self.language_code = DEFAULT_LANGUAGE
+
+        self.root.title(self.t("app_title"))
         self.root.geometry("1120x760")
         self.root.minsize(980, 680)
 
-        database_init()
         self.build_ui()
         self.bind_shortcuts()
-        self.refresh_all("Ready.")
+        self.refresh_all(self.t("ready"))
+
+    def t(self, key, **kwargs):
+        return translate(self.language_code, key, **kwargs)
 
     def build_ui(self):
         self.style = ttk.Style()
@@ -123,11 +89,11 @@ class ExpenseTrackerApp:
         self.categories_tab = ttk.Frame(self.notebook)
         self.tools_tab = ttk.Frame(self.notebook)
 
-        self.notebook.add(self.records_tab, text="Records")
-        self.notebook.add(self.reports_tab, text="Reports")
-        self.notebook.add(self.budgets_tab, text="Budgets")
-        self.notebook.add(self.categories_tab, text="Categories")
-        self.notebook.add(self.tools_tab, text="Tools")
+        self.notebook.add(self.records_tab, text=self.t("records"))
+        self.notebook.add(self.reports_tab, text=self.t("reports"))
+        self.notebook.add(self.budgets_tab, text=self.t("budgets"))
+        self.notebook.add(self.categories_tab, text=self.t("categories"))
+        self.notebook.add(self.tools_tab, text=self.t("tools"))
 
         self.build_records_tab()
         self.build_reports_tab()
@@ -141,11 +107,36 @@ class ExpenseTrackerApp:
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
 
-        title = ttk.Label(header, text="Expense Tracker", font=("Segoe UI", 16, "bold"))
+        title = ttk.Label(header, text=self.t("app_title"), font=("Segoe UI", 16, "bold"))
         title.grid(row=0, column=0, sticky="w")
 
+        ttk.Label(header, text=self.t("language")).grid(row=0, column=1, sticky="e", padx=(0, 6))
+        self.language_var = tk.StringVar(value=self.language_code)
+        language_combo = ttk.Combobox(
+            header,
+            textvariable=self.language_var,
+            values=list(LANGUAGES.keys()),
+            state="readonly",
+            width=5,
+        )
+        language_combo.grid(row=0, column=2, sticky="e", padx=(0, 12))
+        language_combo.bind("<<ComboboxSelected>>", self.change_language)
+
         self.version_label = ttk.Label(header, text="v26.5.1")
-        self.version_label.grid(row=0, column=1, sticky="e")
+        self.version_label.grid(row=0, column=3, sticky="e")
+
+    def change_language(self, event=None):
+        new_language = self.language_var.get()
+        if new_language not in LANGUAGES or new_language == self.language_code:
+            return
+
+        self.language_code = new_language
+        set_setting("language", new_language)
+        for child in self.root.winfo_children():
+            child.destroy()
+        self.build_ui()
+        self.bind_shortcuts()
+        self.refresh_all(self.t("ready"))
 
     def build_records_tab(self):
         self.records_tab.columnconfigure(0, weight=1)
@@ -156,7 +147,7 @@ class ExpenseTrackerApp:
         self.build_record_table()
 
     def build_record_editor(self):
-        editor = ttk.LabelFrame(self.records_tab, text="Record", padding=12)
+        editor = ttk.LabelFrame(self.records_tab, text=self.t("record"), padding=12)
         editor.grid(row=0, column=0, padx=10, pady=(10, 8), sticky="ew")
         for column in range(8):
             editor.columnconfigure(column, weight=1)
@@ -167,11 +158,11 @@ class ExpenseTrackerApp:
         self.amount_var = tk.StringVar()
         self.note_var = tk.StringVar()
 
-        ttk.Label(editor, text="Date").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Label(editor, text=self.t("date")).grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.date_entry = ttk.Entry(editor, textvariable=self.date_var, width=12)
         self.date_entry.grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(3, 0))
 
-        ttk.Label(editor, text="Type").grid(row=0, column=1, sticky="w", padx=(0, 6))
+        ttk.Label(editor, text=self.t("type")).grid(row=0, column=1, sticky="w", padx=(0, 6))
         self.type_combo = ttk.Combobox(
             editor,
             textvariable=self.type_var,
@@ -181,22 +172,22 @@ class ExpenseTrackerApp:
         )
         self.type_combo.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(3, 0))
 
-        ttk.Label(editor, text="Category").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Label(editor, text=self.t("category")).grid(row=0, column=2, sticky="w", padx=(0, 6))
         self.category_combo = ttk.Combobox(editor, textvariable=self.category_var, width=18)
         self.category_combo.grid(row=1, column=2, sticky="ew", padx=(0, 10), pady=(3, 0))
 
-        ttk.Label(editor, text="Amount").grid(row=0, column=3, sticky="w", padx=(0, 6))
+        ttk.Label(editor, text=self.t("amount")).grid(row=0, column=3, sticky="w", padx=(0, 6))
         self.amount_entry = ttk.Entry(editor, textvariable=self.amount_var, width=12)
         self.amount_entry.grid(row=1, column=3, sticky="ew", padx=(0, 10), pady=(3, 0))
 
-        ttk.Label(editor, text="Note").grid(row=0, column=4, sticky="w", padx=(0, 6))
+        ttk.Label(editor, text=self.t("note")).grid(row=0, column=4, sticky="w", padx=(0, 6))
         self.note_entry = ttk.Entry(editor, textvariable=self.note_var)
         self.note_entry.grid(row=1, column=4, columnspan=2, sticky="ew", padx=(0, 10), pady=(3, 0))
 
-        self.save_button = ttk.Button(editor, text="Add Record", command=self.save_record)
+        self.save_button = ttk.Button(editor, text=self.t("add_record"), command=self.save_record)
         self.save_button.grid(row=1, column=6, sticky="ew", padx=(0, 8), pady=(3, 0))
 
-        clear_button = ttk.Button(editor, text="Clear", command=self.clear_form)
+        clear_button = ttk.Button(editor, text=self.t("clear"), command=self.clear_form)
         clear_button.grid(row=1, column=7, sticky="ew", pady=(3, 0))
 
     def build_record_filters(self):
@@ -208,11 +199,11 @@ class ExpenseTrackerApp:
         self.category_filter_var = tk.StringVar()
         self.search_var = tk.StringVar()
 
-        ttk.Label(filters, text="Month").grid(row=0, column=0, sticky="w")
+        ttk.Label(filters, text=self.t("month")).grid(row=0, column=0, sticky="w")
         self.month_filter = ttk.Combobox(filters, textvariable=self.month_filter_var, width=10)
         self.month_filter.grid(row=0, column=1, sticky="w", padx=(6, 14))
 
-        ttk.Label(filters, text="Category").grid(row=0, column=2, sticky="w")
+        ttk.Label(filters, text=self.t("category")).grid(row=0, column=2, sticky="w")
         self.category_filter = ttk.Combobox(
             filters,
             textvariable=self.category_filter_var,
@@ -220,15 +211,15 @@ class ExpenseTrackerApp:
         )
         self.category_filter.grid(row=0, column=3, sticky="w", padx=(6, 14))
 
-        ttk.Label(filters, text="Search").grid(row=0, column=4, sticky="w")
+        ttk.Label(filters, text=self.t("search")).grid(row=0, column=4, sticky="w")
         ttk.Entry(filters, textvariable=self.search_var, width=22).grid(
             row=0, column=5, sticky="w", padx=(6, 14)
         )
 
-        ttk.Button(filters, text="Apply", command=lambda: self.refresh_records()).grid(
+        ttk.Button(filters, text=self.t("apply"), command=lambda: self.refresh_records()).grid(
             row=0, column=7, sticky="e", padx=(0, 8)
         )
-        ttk.Button(filters, text="Reset", command=self.reset_filters).grid(
+        ttk.Button(filters, text=self.t("reset"), command=self.reset_filters).grid(
             row=0, column=8, sticky="e"
         )
 
@@ -237,10 +228,10 @@ class ExpenseTrackerApp:
         for column in range(4):
             summary.columnconfigure(column, weight=1)
 
-        self.total_expense_var = tk.StringVar(value="Expense: $0.00")
-        self.total_income_var = tk.StringVar(value="Income: $0.00")
-        self.balance_var = tk.StringVar(value="Balance: $0.00")
-        self.count_var = tk.StringVar(value="Records: 0")
+        self.total_expense_var = tk.StringVar(value=f"{self.t('expense')}: $0.00")
+        self.total_income_var = tk.StringVar(value=f"{self.t('income')}: $0.00")
+        self.balance_var = tk.StringVar(value=f"{self.t('balance')}: $0.00")
+        self.count_var = tk.StringVar(value=f"{self.t('count')}: 0")
 
         ttk.Label(summary, textvariable=self.total_expense_var).grid(row=0, column=0, sticky="w")
         ttk.Label(summary, textvariable=self.total_income_var).grid(row=0, column=1, sticky="w")
@@ -255,11 +246,11 @@ class ExpenseTrackerApp:
 
         columns = ("date", "type", "category", "amount", "note")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
-        self.tree.heading("date", text="Date")
-        self.tree.heading("type", text="Type")
-        self.tree.heading("category", text="Category")
-        self.tree.heading("amount", text="Amount")
-        self.tree.heading("note", text="Note")
+        self.tree.heading("date", text=self.t("date"))
+        self.tree.heading("type", text=self.t("type"))
+        self.tree.heading("category", text=self.t("category"))
+        self.tree.heading("amount", text=self.t("amount"))
+        self.tree.heading("note", text=self.t("note"))
 
         self.tree.column("date", width=110, minwidth=90, anchor="w")
         self.tree.column("type", width=90, minwidth=80, anchor="w")
@@ -282,10 +273,10 @@ class ExpenseTrackerApp:
         actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         actions.columnconfigure(3, weight=1)
 
-        ttk.Button(actions, text="Edit", command=self.start_edit).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(actions, text="Delete", command=self.delete_selected).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(actions, text="Export CSV", command=self.export_csv).grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(actions, text="Import CSV", command=self.import_csv).grid(row=0, column=3)
+        ttk.Button(actions, text=self.t("edit"), command=self.start_edit).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text=self.t("delete"), command=self.delete_selected).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(actions, text=self.t("export_csv"), command=self.export_csv).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(actions, text=self.t("import_csv"), command=self.import_csv).grid(row=0, column=3)
 
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.tree.bind("<Double-1>", lambda event: self.start_edit())
@@ -301,10 +292,10 @@ class ExpenseTrackerApp:
         controls.columnconfigure(4, weight=1)
 
         self.report_month_var = tk.StringVar(value=CURRENT_MONTH)
-        ttk.Label(controls, text="Month").grid(row=0, column=0, sticky="w")
+        ttk.Label(controls, text=self.t("month")).grid(row=0, column=0, sticky="w")
         self.report_month_combo = ttk.Combobox(controls, textvariable=self.report_month_var, width=10)
         self.report_month_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
-        ttk.Button(controls, text="Refresh", command=lambda: self.refresh_reports()).grid(
+        ttk.Button(controls, text=self.t("refresh"), command=lambda: self.refresh_reports()).grid(
             row=0, column=2, sticky="w"
         )
 
@@ -313,10 +304,10 @@ class ExpenseTrackerApp:
         for column in range(4):
             metrics.columnconfigure(column, weight=1)
 
-        self.report_income_var = tk.StringVar(value="Income: $0.00")
-        self.report_expense_var = tk.StringVar(value="Expense: $0.00")
-        self.report_balance_var = tk.StringVar(value="Balance: $0.00")
-        self.report_top_category_var = tk.StringVar(value="Top category: -")
+        self.report_income_var = tk.StringVar(value=f"{self.t('income')}: $0.00")
+        self.report_expense_var = tk.StringVar(value=f"{self.t('expense')}: $0.00")
+        self.report_balance_var = tk.StringVar(value=f"{self.t('balance')}: $0.00")
+        self.report_top_category_var = tk.StringVar(value=f"{self.t('top_category')}: -")
 
         ttk.Label(metrics, textvariable=self.report_income_var).grid(row=0, column=0, sticky="w")
         ttk.Label(metrics, textvariable=self.report_expense_var).grid(row=0, column=1, sticky="w")
@@ -334,7 +325,7 @@ class ExpenseTrackerApp:
         self.budgets_tab.columnconfigure(0, weight=1)
         self.budgets_tab.rowconfigure(2, weight=1)
 
-        editor = ttk.LabelFrame(self.budgets_tab, text="Monthly Budget", padding=12)
+        editor = ttk.LabelFrame(self.budgets_tab, text=self.t("monthly_budget"), padding=12)
         editor.grid(row=0, column=0, padx=10, pady=(10, 8), sticky="ew")
         for column in range(7):
             editor.columnconfigure(column, weight=1)
@@ -343,30 +334,30 @@ class ExpenseTrackerApp:
         self.budget_category_var = tk.StringVar()
         self.budget_amount_var = tk.StringVar()
 
-        ttk.Label(editor, text="Month").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Label(editor, text=self.t("month")).grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.budget_month_combo = ttk.Combobox(editor, textvariable=self.budget_month_var, width=10)
         self.budget_month_combo.grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(3, 0))
 
-        ttk.Label(editor, text="Category").grid(row=0, column=1, sticky="w", padx=(0, 6))
+        ttk.Label(editor, text=self.t("category")).grid(row=0, column=1, sticky="w", padx=(0, 6))
         self.budget_category_combo = ttk.Combobox(editor, textvariable=self.budget_category_var, width=18)
         self.budget_category_combo.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(3, 0))
 
-        ttk.Label(editor, text="Amount").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Label(editor, text=self.t("amount")).grid(row=0, column=2, sticky="w", padx=(0, 6))
         ttk.Entry(editor, textvariable=self.budget_amount_var, width=12).grid(
             row=1, column=2, sticky="ew", padx=(0, 10), pady=(3, 0)
         )
 
-        ttk.Button(editor, text="Save Budget", command=self.save_budget).grid(
+        ttk.Button(editor, text=self.t("save_budget"), command=self.save_budget).grid(
             row=1, column=3, sticky="ew", padx=(0, 8), pady=(3, 0)
         )
-        ttk.Button(editor, text="Clear", command=self.clear_budget_form).grid(
+        ttk.Button(editor, text=self.t("clear"), command=self.clear_budget_form).grid(
             row=1, column=4, sticky="ew", padx=(0, 8), pady=(3, 0)
         )
-        ttk.Button(editor, text="Delete", command=self.delete_selected_budget).grid(
+        ttk.Button(editor, text=self.t("delete"), command=self.delete_selected_budget).grid(
             row=1, column=5, sticky="ew", pady=(3, 0)
         )
 
-        self.budget_summary_var = tk.StringVar(value="No budgets for this month.")
+        self.budget_summary_var = tk.StringVar(value="")
         ttk.Label(self.budgets_tab, textvariable=self.budget_summary_var, padding=(10, 0, 10, 8)).grid(
             row=1, column=0, sticky="ew"
         )
@@ -378,11 +369,11 @@ class ExpenseTrackerApp:
 
         columns = ("category", "budget", "spent", "remaining", "usage")
         self.budget_tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
-        self.budget_tree.heading("category", text="Category")
-        self.budget_tree.heading("budget", text="Budget")
-        self.budget_tree.heading("spent", text="Spent")
-        self.budget_tree.heading("remaining", text="Remaining")
-        self.budget_tree.heading("usage", text="Usage")
+        self.budget_tree.heading("category", text=self.t("category"))
+        self.budget_tree.heading("budget", text=self.t("budget"))
+        self.budget_tree.heading("spent", text=self.t("spent"))
+        self.budget_tree.heading("remaining", text=self.t("remaining"))
+        self.budget_tree.heading("usage", text=self.t("usage"))
 
         self.budget_tree.column("category", width=180, minwidth=130, anchor="w")
         self.budget_tree.column("budget", width=120, minwidth=100, anchor="e")
@@ -407,7 +398,7 @@ class ExpenseTrackerApp:
         self.categories_tab.columnconfigure(0, weight=1)
         self.categories_tab.rowconfigure(1, weight=1)
 
-        editor = ttk.LabelFrame(self.categories_tab, text="Category", padding=12)
+        editor = ttk.LabelFrame(self.categories_tab, text=self.t("category"), padding=12)
         editor.grid(row=0, column=0, padx=10, pady=(10, 8), sticky="ew")
         for column in range(7):
             editor.columnconfigure(column, weight=1)
@@ -416,12 +407,12 @@ class ExpenseTrackerApp:
         self.category_color_var = tk.StringVar(value="#2f6f8f")
         self.category_default_budget_var = tk.StringVar()
 
-        ttk.Label(editor, text="Name").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Label(editor, text=self.t("name")).grid(row=0, column=0, sticky="w", padx=(0, 6))
         ttk.Entry(editor, textvariable=self.category_name_var, width=18).grid(
             row=1, column=0, sticky="ew", padx=(0, 10), pady=(3, 0)
         )
 
-        ttk.Label(editor, text="Color").grid(row=0, column=1, sticky="w", padx=(0, 6))
+        ttk.Label(editor, text=self.t("color")).grid(row=0, column=1, sticky="w", padx=(0, 6))
         self.category_color_combo = ttk.Combobox(
             editor,
             textvariable=self.category_color_var,
@@ -439,18 +430,18 @@ class ExpenseTrackerApp:
         )
         self.category_color_combo.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(3, 0))
 
-        ttk.Label(editor, text="Default Budget").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Label(editor, text=self.t("default_budget")).grid(row=0, column=2, sticky="w", padx=(0, 6))
         ttk.Entry(editor, textvariable=self.category_default_budget_var, width=12).grid(
             row=1, column=2, sticky="ew", padx=(0, 10), pady=(3, 0)
         )
 
-        self.category_save_button = ttk.Button(editor, text="Save Category", command=self.save_category)
+        self.category_save_button = ttk.Button(editor, text=self.t("save_category"), command=self.save_category)
         self.category_save_button.grid(row=1, column=3, sticky="ew", padx=(0, 8), pady=(3, 0))
 
-        ttk.Button(editor, text="Clear", command=self.clear_category_form).grid(
+        ttk.Button(editor, text=self.t("clear"), command=self.clear_category_form).grid(
             row=1, column=4, sticky="ew", padx=(0, 8), pady=(3, 0)
         )
-        ttk.Button(editor, text="Delete Unused", command=self.delete_selected_category).grid(
+        ttk.Button(editor, text=self.t("delete_unused"), command=self.delete_selected_category).grid(
             row=1, column=5, sticky="ew", pady=(3, 0)
         )
 
@@ -461,11 +452,11 @@ class ExpenseTrackerApp:
 
         columns = ("name", "color", "default_budget", "records", "budgets")
         self.category_tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
-        self.category_tree.heading("name", text="Name")
-        self.category_tree.heading("color", text="Color")
-        self.category_tree.heading("default_budget", text="Default Budget")
-        self.category_tree.heading("records", text="Records")
-        self.category_tree.heading("budgets", text="Budgets")
+        self.category_tree.heading("name", text=self.t("name"))
+        self.category_tree.heading("color", text=self.t("color"))
+        self.category_tree.heading("default_budget", text=self.t("default_budget"))
+        self.category_tree.heading("records", text=self.t("records"))
+        self.category_tree.heading("budgets", text=self.t("budgets"))
 
         self.category_tree.column("name", width=200, minwidth=140, anchor="w")
         self.category_tree.column("color", width=110, minwidth=90, anchor="w")
@@ -484,26 +475,26 @@ class ExpenseTrackerApp:
     def build_tools_tab(self):
         self.tools_tab.columnconfigure(0, weight=1)
 
-        data_frame = ttk.LabelFrame(self.tools_tab, text="Data", padding=12)
+        data_frame = ttk.LabelFrame(self.tools_tab, text=self.t("data"), padding=12)
         data_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
         data_frame.columnconfigure(1, weight=1)
 
         self.db_path_var = tk.StringVar(value=str(get_db_path()))
-        ttk.Label(data_frame, text="Database").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(data_frame, text=self.t("database")).grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Label(data_frame, textvariable=self.db_path_var).grid(row=0, column=1, sticky="ew")
 
-        ttk.Button(data_frame, text="Backup Database", command=self.backup_data).grid(
+        ttk.Button(data_frame, text=self.t("backup_database"), command=self.backup_data).grid(
             row=1, column=0, sticky="w", pady=(12, 0)
         )
-        ttk.Button(data_frame, text="Restore Database", command=self.restore_data).grid(
+        ttk.Button(data_frame, text=self.t("restore_database"), command=self.restore_data).grid(
             row=1, column=1, sticky="w", padx=(8, 0), pady=(12, 0)
         )
-        ttk.Button(data_frame, text="Open Data Folder", command=self.open_data_folder).grid(
+        ttk.Button(data_frame, text=self.t("open_data_folder"), command=self.open_data_folder).grid(
             row=1, column=2, sticky="w", padx=(8, 0), pady=(12, 0)
         )
 
     def build_status_bar(self):
-        self.status_var = tk.StringVar(value="Ready.")
+        self.status_var = tk.StringVar(value=self.t("ready"))
         status = ttk.Label(self.root, textvariable=self.status_var, anchor="w", padding=(16, 6))
         status.grid(row=2, column=0, sticky="ew")
 
@@ -513,6 +504,9 @@ class ExpenseTrackerApp:
 
     def set_status(self, message):
         self.status_var.set(message)
+
+    def type_text(self, record_type):
+        return self.t(record_type) if record_type in TYPE_OPTIONS else record_type
 
     def refresh_all(self, status_message=None):
         self.refresh_records(status_message)
@@ -543,7 +537,7 @@ class ExpenseTrackerApp:
         elif current == str(self.categories_tab):
             self.save_category()
         else:
-            self.set_status("Nothing to save on this tab.")
+            self.set_status(self.t("nothing_to_save"))
 
     def clear_current_tab(self):
         current = self.notebook.select()
@@ -554,7 +548,7 @@ class ExpenseTrackerApp:
         elif current == str(self.categories_tab):
             self.clear_category_form()
         else:
-            self.set_status("Nothing to clear on this tab.")
+            self.set_status(self.t("nothing_to_clear"))
 
     def filters(self):
         month = parse_month(self.month_filter_var.get())
@@ -573,7 +567,7 @@ class ExpenseTrackerApp:
         self.populate_table()
         self.update_summary()
         self.update_picker_options()
-        self.set_status(status_message or f"Showing {len(self.records)} record(s).")
+        self.set_status(status_message or f"{self.t('count')}: {len(self.records)}")
 
     def populate_table(self):
         for item in self.tree.get_children():
@@ -592,7 +586,7 @@ class ExpenseTrackerApp:
                 iid=str(record["id"]),
                 values=(
                     record["date"],
-                    record["type"].title(),
+                    self.type_text(record["type"]),
                     record["category"],
                     amount,
                     record["note"] or "",
@@ -607,10 +601,10 @@ class ExpenseTrackerApp:
         )
         balance = income - expense
 
-        self.total_expense_var.set(f"Expense: {money_text(expense)}")
-        self.total_income_var.set(f"Income: {money_text(income)}")
-        self.balance_var.set(f"Balance: {money_text(balance)}")
-        self.count_var.set(f"Records: {len(self.records)}")
+        self.total_expense_var.set(f"{self.t('expense')}: {money_text(expense)}")
+        self.total_income_var.set(f"{self.t('income')}: {money_text(income)}")
+        self.balance_var.set(f"{self.t('balance')}: {money_text(balance)}")
+        self.count_var.set(f"{self.t('count')}: {len(self.records)}")
 
     def selected_record(self):
         selected = self.tree.selection()
@@ -649,7 +643,7 @@ class ExpenseTrackerApp:
         if self.editing_record_id is None:
             insert_record(record_type, category, amount_cents, note, record_date)
             self.clear_form(reset_status=False)
-            self.refresh_all("Record added.")
+            self.refresh_all(self.t("record_added"))
             return
 
         updated = update_record(
@@ -661,7 +655,7 @@ class ExpenseTrackerApp:
             record_date,
         )
         self.clear_form(reset_status=False)
-        self.refresh_all("Record updated." if updated else "Record was not found.")
+        self.refresh_all(self.t("record_updated") if updated else "Record was not found.")
 
     def start_edit(self):
         record = self.selected_record()
@@ -675,7 +669,7 @@ class ExpenseTrackerApp:
         self.category_var.set(record["category"])
         self.amount_var.set(amount_entry_text(record["amount_cents"]))
         self.note_var.set(record["note"] or "")
-        self.save_button.configure(text="Update Record")
+        self.save_button.configure(text=self.t("update_record"))
         self.set_status(f"Editing record #{record['id']}.")
         self.notebook.select(self.records_tab)
         self.date_entry.focus_set()
@@ -687,10 +681,10 @@ class ExpenseTrackerApp:
         self.category_var.set("")
         self.amount_var.set("")
         self.note_var.set("")
-        self.save_button.configure(text="Add Record")
+        self.save_button.configure(text=self.t("add_record"))
         self.tree.selection_remove(self.tree.selection())
         if reset_status:
-            self.set_status("Form cleared.")
+            self.set_status(self.t("form_cleared"))
 
     def delete_selected(self):
         record = self.selected_record()
@@ -709,13 +703,13 @@ class ExpenseTrackerApp:
         delete_record(record["id"])
         if self.editing_record_id == record["id"]:
             self.clear_form(reset_status=False)
-        self.refresh_all("Record deleted.")
+        self.refresh_all(self.t("record_deleted"))
 
     def reset_filters(self):
         self.month_filter_var.set("")
         self.category_filter_var.set("")
         self.search_var.set("")
-        self.refresh_records("Filters reset.")
+        self.refresh_records(self.t("filters_reset"))
 
     def export_csv(self):
         if not self.records:
@@ -751,27 +745,32 @@ class ExpenseTrackerApp:
 
     def import_csv(self):
         path = filedialog.askopenfilename(
-            title="Import CSV",
+            title=self.t("import_csv"),
             filetypes=(("CSV files", "*.csv"), ("All files", "*.*")),
         )
         if not path:
-            self.set_status("Import cancelled.")
+            self.set_status(self.t("import_cancelled"))
             return
 
         try:
-            records = self.read_csv_records(path)
+            parsed_records = parse_csv_records(path)
+            records, duplicates = split_new_and_duplicate_records(parsed_records, load_records())
         except (OSError, ValueError) as exc:
-            messagebox.showerror("Import failed", str(exc))
-            self.set_status("Import failed.")
+            messagebox.showerror(self.t("import_failed"), str(exc))
+            self.set_status(self.t("import_failed"))
             return
 
         if not records:
-            self.set_status("CSV did not contain any records.")
+            messagebox.showinfo(
+                self.t("import_preview"),
+                self.t("import_summary", new_count=0, duplicate_count=len(duplicates)),
+            )
+            self.set_status(self.t("import_cancelled"))
             return
 
-        confirmed = messagebox.askyesno("Import CSV", f"Import {len(records)} record(s)?")
+        confirmed = self.show_import_preview(records, duplicates)
         if not confirmed:
-            self.set_status("Import cancelled.")
+            self.set_status(self.t("import_cancelled"))
             return
 
         for record in records:
@@ -786,48 +785,89 @@ class ExpenseTrackerApp:
         self.refresh_all(f"Imported {len(records)} record(s).")
 
     def read_csv_records(self, path):
-        with open(path, newline="", encoding="utf-8-sig") as csv_file:
-            reader = csv.DictReader(csv_file)
-            if reader.fieldnames is None:
-                raise ValueError("CSV file is missing a header row.")
+        return parse_csv_records(path)
 
-            header_map = {name.strip().lower(): name for name in reader.fieldnames if name}
-            required = ("date", "type", "category", "amount")
-            missing = [name for name in required if name not in header_map]
-            if missing:
-                raise ValueError(f"CSV is missing required column(s): {', '.join(missing)}.")
+    def show_import_preview(self, records, duplicates):
+        dialog = tk.Toplevel(self.root)
+        dialog.title(self.t("import_preview"))
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("760x480")
+        dialog.minsize(680, 420)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
 
-            imported = []
-            errors = []
-            for row_number, row in enumerate(reader, start=2):
-                try:
-                    record_type = (row[header_map["type"]] or "").strip().lower()
-                    if record_type not in TYPE_OPTIONS:
-                        raise ValueError("type must be income or expense")
+        confirmed = {"value": False}
 
-                    category = (row[header_map["category"]] or "").strip()
-                    if not category:
-                        raise ValueError("category must be non-empty")
+        summary = self.t(
+            "import_summary",
+            new_count=len(records),
+            duplicate_count=len(duplicates),
+        )
+        ttk.Label(dialog, text=summary, padding=(12, 10)).grid(row=0, column=0, sticky="ew")
 
-                    imported.append(
-                        {
-                            "date": parse_record_date(row[header_map["date"]] or ""),
-                            "type": record_type,
-                            "category": category,
-                            "amount_cents": amount_to_cents(row[header_map["amount"]] or ""),
-                            "note": (row.get(header_map.get("note", ""), "") or "").strip(),
-                        }
-                    )
-                except ValueError as exc:
-                    errors.append(f"Row {row_number}: {exc}")
+        preview_tabs = ttk.Notebook(dialog)
+        preview_tabs.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 10))
 
-            if errors:
-                detail = "\n".join(errors[:8])
-                if len(errors) > 8:
-                    detail += f"\n...and {len(errors) - 8} more error(s)."
-                raise ValueError(detail)
+        new_frame = ttk.Frame(preview_tabs)
+        duplicate_frame = ttk.Frame(preview_tabs)
+        preview_tabs.add(new_frame, text=f"{self.t('new_records')} ({len(records)})")
+        preview_tabs.add(duplicate_frame, text=f"{self.t('duplicates')} ({len(duplicates)})")
 
-            return imported
+        self.build_preview_table(new_frame, records)
+        self.build_preview_table(duplicate_frame, duplicates)
+
+        actions = ttk.Frame(dialog, padding=(12, 0, 12, 12))
+        actions.grid(row=2, column=0, sticky="ew")
+        actions.columnconfigure(0, weight=1)
+
+        def accept():
+            confirmed["value"] = True
+            dialog.destroy()
+
+        ttk.Button(actions, text=self.t("confirm"), command=accept).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(actions, text=self.t("cancel"), command=dialog.destroy).grid(row=0, column=2)
+
+        self.root.wait_window(dialog)
+        return confirmed["value"]
+
+    def build_preview_table(self, parent, records):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        columns = ("date", "type", "category", "amount", "note")
+        tree = ttk.Treeview(parent, columns=columns, show="headings")
+        for column, label_key in (
+            ("date", "date"),
+            ("type", "type"),
+            ("category", "category"),
+            ("amount", "amount"),
+            ("note", "note"),
+        ):
+            tree.heading(column, text=self.t(label_key))
+
+        tree.column("date", width=100, anchor="w")
+        tree.column("type", width=90, anchor="w")
+        tree.column("category", width=140, anchor="w")
+        tree.column("amount", width=110, anchor="e")
+        tree.column("note", width=280, anchor="w")
+
+        scroll = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        for record in records[:200]:
+            tree.insert(
+                "",
+                tk.END,
+                values=(
+                    record["date"],
+                    self.type_text(record["type"]),
+                    record["category"],
+                    money_text(record["amount_cents"]),
+                    record["note"],
+                ),
+            )
 
     def refresh_reports(self, update_status=True):
         try:
@@ -844,23 +884,23 @@ class ExpenseTrackerApp:
         self.category_chart_data = load_category_spending(month=month)
         self.monthly_chart_data = load_monthly_summary(limit=12)
 
-        self.report_income_var.set(f"Income: {money_text(income)}")
-        self.report_expense_var.set(f"Expense: {money_text(expense)}")
-        self.report_balance_var.set(f"Balance: {money_text(balance)}")
+        self.report_income_var.set(f"{self.t('income')}: {money_text(income)}")
+        self.report_expense_var.set(f"{self.t('expense')}: {money_text(expense)}")
+        self.report_balance_var.set(f"{self.t('balance')}: {money_text(balance)}")
 
         if self.category_chart_data:
             top = self.category_chart_data[0]
             self.report_top_category_var.set(
-                f"Top category: {top['category']} ({money_text(top['spent_cents'])})"
+                f"{self.t('top_category')}: {top['category']} ({money_text(top['spent_cents'])})"
             )
         else:
-            self.report_top_category_var.set("Top category: -")
+            self.report_top_category_var.set(f"{self.t('top_category')}: -")
 
         self.draw_category_chart()
         self.draw_trend_chart()
         self.update_picker_options()
         if update_status:
-            self.set_status("Reports refreshed.")
+            self.set_status(self.t("reports_refreshed"))
 
     def draw_category_chart(self):
         canvas = self.category_canvas
@@ -872,11 +912,11 @@ class ExpenseTrackerApp:
         top = 44
         row_height = 30
 
-        canvas.create_text(16, 16, anchor="w", text="Category Spending", font=("Segoe UI", 11, "bold"), fill="#24292f")
+        canvas.create_text(16, 16, anchor="w", text=self.t("category_spending"), font=("Segoe UI", 11, "bold"), fill="#24292f")
 
         rows = self.category_chart_data[:8]
         if not rows:
-            canvas.create_text(width / 2, height / 2, text="No expense data for this view.", fill="#57606a")
+            canvas.create_text(width / 2, height / 2, text=self.t("no_expense_data"), fill="#57606a")
             return
 
         max_value = max(row["spent_cents"] or 0 for row in rows) or 1
@@ -902,10 +942,10 @@ class ExpenseTrackerApp:
         top = 44
         bottom = 40
 
-        canvas.create_text(16, 16, anchor="w", text="12-Month Trend", font=("Segoe UI", 11, "bold"), fill="#24292f")
+        canvas.create_text(16, 16, anchor="w", text=self.t("trend"), font=("Segoe UI", 11, "bold"), fill="#24292f")
         rows = self.monthly_chart_data
         if not rows:
-            canvas.create_text(width / 2, height / 2, text="No monthly data yet.", fill="#57606a")
+            canvas.create_text(width / 2, height / 2, text=self.t("no_monthly_data"), fill="#57606a")
             return
 
         max_value = max(
@@ -918,9 +958,9 @@ class ExpenseTrackerApp:
 
         canvas.create_line(left, top + chart_height, width - right, top + chart_height, fill="#d0d7de")
         canvas.create_text(left, top - 8, anchor="w", text=money_text(max_value), fill="#57606a")
-        canvas.create_text(width - right - 140, 18, anchor="w", text="Income", fill="#18794e")
+        canvas.create_text(width - right - 140, 18, anchor="w", text=self.t("income"), fill="#18794e")
         canvas.create_rectangle(width - right - 160, 12, width - right - 146, 24, fill="#18794e", outline="")
-        canvas.create_text(width - right - 68, 18, anchor="w", text="Expense", fill="#b42318")
+        canvas.create_text(width - right - 68, 18, anchor="w", text=self.t("expense"), fill="#b42318")
         canvas.create_rectangle(width - right - 88, 12, width - right - 74, 24, fill="#b42318", outline="")
 
         for index, row in enumerate(rows):
@@ -1026,15 +1066,15 @@ class ExpenseTrackerApp:
 
         if self.budgets:
             self.budget_summary_var.set(
-                f"{month}: {money_text(total_spent)} spent of {money_text(total_budget)} budgeted; "
-                f"{over_count} over budget."
+                f"{month}: {self.t('spent')} {money_text(total_spent)} / "
+                f"{self.t('budget')} {money_text(total_budget)}; {over_count} over."
             )
         else:
-            self.budget_summary_var.set(f"No budgets for {month}.")
+            self.budget_summary_var.set(f"{self.t('budgets')}: 0 ({month})")
 
         self.update_picker_options()
         if update_status:
-            self.set_status("Budgets refreshed.")
+            self.set_status(self.t("budgets_refreshed"))
 
     def selected_budget(self):
         selected = self.budget_tree.selection()
@@ -1066,14 +1106,14 @@ class ExpenseTrackerApp:
         self.budget_month_var.set(month)
         self.refresh_budgets(update_status=False)
         self.refresh_reports(update_status=False)
-        self.set_status("Budget saved.")
+        self.set_status(self.t("budget_saved"))
 
     def clear_budget_form(self, reset_status=True):
         self.budget_category_var.set("")
         self.budget_amount_var.set("")
         self.budget_tree.selection_remove(self.budget_tree.selection())
         if reset_status:
-            self.set_status("Budget form cleared.")
+            self.set_status(self.t("form_cleared"))
 
     def delete_selected_budget(self):
         budget = self.selected_budget()
@@ -1092,7 +1132,7 @@ class ExpenseTrackerApp:
         delete_budget(budget["id"])
         self.clear_budget_form(reset_status=False)
         self.refresh_budgets(update_status=False)
-        self.set_status("Budget deleted.")
+        self.set_status(self.t("budget_deleted"))
 
     def refresh_categories(self, update_status=True):
         self.categories = load_categories()
@@ -1116,7 +1156,7 @@ class ExpenseTrackerApp:
 
         self.update_picker_options()
         if update_status:
-            self.set_status("Categories refreshed.")
+            self.set_status(self.t("categories_refreshed"))
 
     def selected_category(self):
         selected = self.category_tree.selection()
@@ -1138,7 +1178,7 @@ class ExpenseTrackerApp:
             self.category_default_budget_var.set(amount_entry_text(category["default_budget_cents"]))
         else:
             self.category_default_budget_var.set("")
-        self.category_save_button.configure(text="Update Category")
+        self.category_save_button.configure(text=self.t("update_category"))
         self.set_status(f"Selected category #{category['id']}.")
 
     def read_category_form(self):
@@ -1168,17 +1208,17 @@ class ExpenseTrackerApp:
             return
 
         self.clear_category_form(reset_status=False)
-        self.refresh_all("Category saved.")
+        self.refresh_all(self.t("category_saved"))
 
     def clear_category_form(self, reset_status=True):
         self.editing_category_id = None
         self.category_name_var.set("")
         self.category_color_var.set("#2f6f8f")
         self.category_default_budget_var.set("")
-        self.category_save_button.configure(text="Save Category")
+        self.category_save_button.configure(text=self.t("save_category"))
         self.category_tree.selection_remove(self.category_tree.selection())
         if reset_status:
-            self.set_status("Category form cleared.")
+            self.set_status(self.t("form_cleared"))
 
     def delete_selected_category(self):
         category = self.selected_category()
@@ -1201,7 +1241,7 @@ class ExpenseTrackerApp:
             return
 
         self.clear_category_form(reset_status=False)
-        self.refresh_all("Category deleted.")
+        self.refresh_all(self.t("category_deleted"))
 
     def backup_data(self):
         default_name = f"expense-tracker-backup-{date.today().isoformat()}.db"

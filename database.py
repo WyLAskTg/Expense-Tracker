@@ -194,6 +194,14 @@ def database_init():
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS Settings(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         _sync_categories(cursor)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_date ON Records(date)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_category ON Records(category)")
@@ -592,3 +600,28 @@ def restore_database(source_path):
     shutil.copy2(source, destination)
     database_init()
     return destination
+
+
+def get_setting(key, default=None):
+    database_init()
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT value FROM Settings WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key, value):
+    database_init()
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute(
+            """
+            INSERT INTO Settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key)
+            DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        db.commit()
