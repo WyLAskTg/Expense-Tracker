@@ -9,16 +9,19 @@ from database import (
     backup_database,
     database_init,
     delete_budget,
+    delete_category,
     delete_record,
     get_categories,
     get_db_path,
     get_months,
     insert_record,
     load_budgets,
+    load_categories,
     load_category_spending,
     load_monthly_summary,
     load_records,
     restore_database,
+    save_category,
     update_record,
     upsert_budget,
 )
@@ -86,9 +89,11 @@ class ExpenseTrackerApp:
         self.root = root
         self.records = []
         self.budgets = []
+        self.categories = []
         self.category_chart_data = []
         self.monthly_chart_data = []
         self.editing_record_id = None
+        self.editing_category_id = None
 
         self.root.title("Expense Tracker")
         self.root.geometry("1120x760")
@@ -115,16 +120,19 @@ class ExpenseTrackerApp:
         self.records_tab = ttk.Frame(self.notebook)
         self.reports_tab = ttk.Frame(self.notebook)
         self.budgets_tab = ttk.Frame(self.notebook)
+        self.categories_tab = ttk.Frame(self.notebook)
         self.tools_tab = ttk.Frame(self.notebook)
 
         self.notebook.add(self.records_tab, text="Records")
         self.notebook.add(self.reports_tab, text="Reports")
         self.notebook.add(self.budgets_tab, text="Budgets")
+        self.notebook.add(self.categories_tab, text="Categories")
         self.notebook.add(self.tools_tab, text="Tools")
 
         self.build_records_tab()
         self.build_reports_tab()
         self.build_budgets_tab()
+        self.build_categories_tab()
         self.build_tools_tab()
         self.build_status_bar()
 
@@ -136,7 +144,7 @@ class ExpenseTrackerApp:
         title = ttk.Label(header, text="Expense Tracker", font=("Segoe UI", 16, "bold"))
         title.grid(row=0, column=0, sticky="w")
 
-        self.version_label = ttk.Label(header, text="v26.6")
+        self.version_label = ttk.Label(header, text="v26.5.1")
         self.version_label.grid(row=0, column=1, sticky="e")
 
     def build_records_tab(self):
@@ -276,7 +284,8 @@ class ExpenseTrackerApp:
 
         ttk.Button(actions, text="Edit", command=self.start_edit).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(actions, text="Delete", command=self.delete_selected).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(actions, text="Export CSV", command=self.export_csv).grid(row=0, column=2)
+        ttk.Button(actions, text="Export CSV", command=self.export_csv).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(actions, text="Import CSV", command=self.import_csv).grid(row=0, column=3)
 
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.tree.bind("<Double-1>", lambda event: self.start_edit())
@@ -392,6 +401,85 @@ class ExpenseTrackerApp:
 
         self.budget_tree.bind("<<TreeviewSelect>>", self.on_budget_select)
         self.budget_tree.bind("<Delete>", lambda event: self.delete_selected_budget())
+        self.budget_category_combo.bind("<<ComboboxSelected>>", self.apply_default_budget)
+
+    def build_categories_tab(self):
+        self.categories_tab.columnconfigure(0, weight=1)
+        self.categories_tab.rowconfigure(1, weight=1)
+
+        editor = ttk.LabelFrame(self.categories_tab, text="Category", padding=12)
+        editor.grid(row=0, column=0, padx=10, pady=(10, 8), sticky="ew")
+        for column in range(7):
+            editor.columnconfigure(column, weight=1)
+
+        self.category_name_var = tk.StringVar()
+        self.category_color_var = tk.StringVar(value="#2f6f8f")
+        self.category_default_budget_var = tk.StringVar()
+
+        ttk.Label(editor, text="Name").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(editor, textvariable=self.category_name_var, width=18).grid(
+            row=1, column=0, sticky="ew", padx=(0, 10), pady=(3, 0)
+        )
+
+        ttk.Label(editor, text="Color").grid(row=0, column=1, sticky="w", padx=(0, 6))
+        self.category_color_combo = ttk.Combobox(
+            editor,
+            textvariable=self.category_color_var,
+            values=(
+                "#b42318",
+                "#2f6f8f",
+                "#9a6700",
+                "#18794e",
+                "#8250df",
+                "#57606a",
+                "#0969da",
+                "#1f883d",
+            ),
+            width=10,
+        )
+        self.category_color_combo.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(3, 0))
+
+        ttk.Label(editor, text="Default Budget").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Entry(editor, textvariable=self.category_default_budget_var, width=12).grid(
+            row=1, column=2, sticky="ew", padx=(0, 10), pady=(3, 0)
+        )
+
+        self.category_save_button = ttk.Button(editor, text="Save Category", command=self.save_category)
+        self.category_save_button.grid(row=1, column=3, sticky="ew", padx=(0, 8), pady=(3, 0))
+
+        ttk.Button(editor, text="Clear", command=self.clear_category_form).grid(
+            row=1, column=4, sticky="ew", padx=(0, 8), pady=(3, 0)
+        )
+        ttk.Button(editor, text="Delete Unused", command=self.delete_selected_category).grid(
+            row=1, column=5, sticky="ew", pady=(3, 0)
+        )
+
+        table_frame = ttk.Frame(self.categories_tab, padding=(10, 0, 10, 10))
+        table_frame.grid(row=1, column=0, sticky="nsew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        columns = ("name", "color", "default_budget", "records", "budgets")
+        self.category_tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        self.category_tree.heading("name", text="Name")
+        self.category_tree.heading("color", text="Color")
+        self.category_tree.heading("default_budget", text="Default Budget")
+        self.category_tree.heading("records", text="Records")
+        self.category_tree.heading("budgets", text="Budgets")
+
+        self.category_tree.column("name", width=200, minwidth=140, anchor="w")
+        self.category_tree.column("color", width=110, minwidth=90, anchor="w")
+        self.category_tree.column("default_budget", width=140, minwidth=110, anchor="e")
+        self.category_tree.column("records", width=90, minwidth=70, anchor="e")
+        self.category_tree.column("budgets", width=90, minwidth=70, anchor="e")
+
+        category_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.category_tree.yview)
+        self.category_tree.configure(yscrollcommand=category_scroll.set)
+        self.category_tree.grid(row=0, column=0, sticky="nsew")
+        category_scroll.grid(row=0, column=1, sticky="ns")
+
+        self.category_tree.bind("<<TreeviewSelect>>", self.on_category_select)
+        self.category_tree.bind("<Delete>", lambda event: self.delete_selected_category())
 
     def build_tools_tab(self):
         self.tools_tab.columnconfigure(0, weight=1)
@@ -430,6 +518,7 @@ class ExpenseTrackerApp:
         self.refresh_records(status_message)
         self.refresh_reports(update_status=False)
         self.refresh_budgets(update_status=False)
+        self.refresh_categories(update_status=False)
         self.update_picker_options()
 
     def update_picker_options(self):
@@ -451,6 +540,8 @@ class ExpenseTrackerApp:
             self.save_record()
         elif current == str(self.budgets_tab):
             self.save_budget()
+        elif current == str(self.categories_tab):
+            self.save_category()
         else:
             self.set_status("Nothing to save on this tab.")
 
@@ -460,6 +551,8 @@ class ExpenseTrackerApp:
             self.clear_form()
         elif current == str(self.budgets_tab):
             self.clear_budget_form()
+        elif current == str(self.categories_tab):
+            self.clear_category_form()
         else:
             self.set_status("Nothing to clear on this tab.")
 
@@ -656,6 +749,86 @@ class ExpenseTrackerApp:
 
         self.set_status(f"Exported {len(self.records)} record(s) to CSV.")
 
+    def import_csv(self):
+        path = filedialog.askopenfilename(
+            title="Import CSV",
+            filetypes=(("CSV files", "*.csv"), ("All files", "*.*")),
+        )
+        if not path:
+            self.set_status("Import cancelled.")
+            return
+
+        try:
+            records = self.read_csv_records(path)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Import failed", str(exc))
+            self.set_status("Import failed.")
+            return
+
+        if not records:
+            self.set_status("CSV did not contain any records.")
+            return
+
+        confirmed = messagebox.askyesno("Import CSV", f"Import {len(records)} record(s)?")
+        if not confirmed:
+            self.set_status("Import cancelled.")
+            return
+
+        for record in records:
+            insert_record(
+                record["type"],
+                record["category"],
+                record["amount_cents"],
+                record["note"],
+                record["date"],
+            )
+
+        self.refresh_all(f"Imported {len(records)} record(s).")
+
+    def read_csv_records(self, path):
+        with open(path, newline="", encoding="utf-8-sig") as csv_file:
+            reader = csv.DictReader(csv_file)
+            if reader.fieldnames is None:
+                raise ValueError("CSV file is missing a header row.")
+
+            header_map = {name.strip().lower(): name for name in reader.fieldnames if name}
+            required = ("date", "type", "category", "amount")
+            missing = [name for name in required if name not in header_map]
+            if missing:
+                raise ValueError(f"CSV is missing required column(s): {', '.join(missing)}.")
+
+            imported = []
+            errors = []
+            for row_number, row in enumerate(reader, start=2):
+                try:
+                    record_type = (row[header_map["type"]] or "").strip().lower()
+                    if record_type not in TYPE_OPTIONS:
+                        raise ValueError("type must be income or expense")
+
+                    category = (row[header_map["category"]] or "").strip()
+                    if not category:
+                        raise ValueError("category must be non-empty")
+
+                    imported.append(
+                        {
+                            "date": parse_record_date(row[header_map["date"]] or ""),
+                            "type": record_type,
+                            "category": category,
+                            "amount_cents": amount_to_cents(row[header_map["amount"]] or ""),
+                            "note": (row.get(header_map.get("note", ""), "") or "").strip(),
+                        }
+                    )
+                except ValueError as exc:
+                    errors.append(f"Row {row_number}: {exc}")
+
+            if errors:
+                detail = "\n".join(errors[:8])
+                if len(errors) > 8:
+                    detail += f"\n...and {len(errors) - 8} more error(s)."
+                raise ValueError(detail)
+
+            return imported
+
     def refresh_reports(self, update_status=True):
         try:
             month = parse_month(self.report_month_var.get())
@@ -714,7 +887,7 @@ class ExpenseTrackerApp:
             y = top + index * row_height
             value = int(row["spent_cents"] or 0)
             length = max(int(bar_width * value / max_value), 2)
-            color = colors[index % len(colors)]
+            color = row.get("color") or colors[index % len(colors)]
             canvas.create_text(16, y + 10, anchor="w", text=row["category"], fill="#24292f")
             canvas.create_rectangle(left, y, left + length, y + 18, fill=color, outline="")
             canvas.create_text(left + length + 8, y + 9, anchor="w", text=money_text(value), fill="#57606a")
@@ -792,6 +965,18 @@ class ExpenseTrackerApp:
 
         amount_cents = amount_to_cents(self.budget_amount_var.get())
         return month, category, amount_cents
+
+    def apply_default_budget(self, event=None):
+        if self.budget_amount_var.get().strip():
+            return
+
+        category_name = self.budget_category_var.get().strip()
+        category = next(
+            (item for item in self.categories if item["name"] == category_name),
+            None,
+        )
+        if category and category["default_budget_cents"]:
+            self.budget_amount_var.set(amount_entry_text(category["default_budget_cents"]))
 
     def refresh_budgets(self, update_status=True):
         try:
@@ -908,6 +1093,115 @@ class ExpenseTrackerApp:
         self.clear_budget_form(reset_status=False)
         self.refresh_budgets(update_status=False)
         self.set_status("Budget deleted.")
+
+    def refresh_categories(self, update_status=True):
+        self.categories = load_categories()
+
+        for item in self.category_tree.get_children():
+            self.category_tree.delete(item)
+
+        for category in self.categories:
+            self.category_tree.insert(
+                "",
+                tk.END,
+                iid=str(category["id"]),
+                values=(
+                    category["name"],
+                    category["color"],
+                    money_text(category["default_budget_cents"]),
+                    category["record_count"],
+                    category["budget_count"],
+                ),
+            )
+
+        self.update_picker_options()
+        if update_status:
+            self.set_status("Categories refreshed.")
+
+    def selected_category(self):
+        selected = self.category_tree.selection()
+        if not selected:
+            return None
+
+        category_id = int(selected[0])
+        return next((category for category in self.categories if category["id"] == category_id), None)
+
+    def on_category_select(self, event=None):
+        category = self.selected_category()
+        if not category:
+            return
+
+        self.editing_category_id = category["id"]
+        self.category_name_var.set(category["name"])
+        self.category_color_var.set(category["color"])
+        if category["default_budget_cents"]:
+            self.category_default_budget_var.set(amount_entry_text(category["default_budget_cents"]))
+        else:
+            self.category_default_budget_var.set("")
+        self.category_save_button.configure(text="Update Category")
+        self.set_status(f"Selected category #{category['id']}.")
+
+    def read_category_form(self):
+        name = self.category_name_var.get().strip()
+        if not name:
+            raise ValueError("Category name must be non-empty.")
+
+        color = self.category_color_var.get().strip() or "#2f6f8f"
+        if not color.startswith("#") or len(color) != 7:
+            raise ValueError("Color must use hex format like #2f6f8f.")
+
+        raw_default = self.category_default_budget_var.get().strip()
+        default_budget_cents = amount_to_cents(raw_default) if raw_default else 0
+        return name, color, default_budget_cents
+
+    def save_category(self):
+        try:
+            name, color, default_budget_cents = self.read_category_form()
+            save_category(
+                name,
+                color=color,
+                default_budget_cents=default_budget_cents,
+                category_id=self.editing_category_id,
+            )
+        except ValueError as exc:
+            self.set_status(str(exc))
+            return
+
+        self.clear_category_form(reset_status=False)
+        self.refresh_all("Category saved.")
+
+    def clear_category_form(self, reset_status=True):
+        self.editing_category_id = None
+        self.category_name_var.set("")
+        self.category_color_var.set("#2f6f8f")
+        self.category_default_budget_var.set("")
+        self.category_save_button.configure(text="Save Category")
+        self.category_tree.selection_remove(self.category_tree.selection())
+        if reset_status:
+            self.set_status("Category form cleared.")
+
+    def delete_selected_category(self):
+        category = self.selected_category()
+        if not category:
+            self.set_status("Select a category to delete.")
+            return
+
+        confirmed = messagebox.askyesno(
+            "Delete category",
+            f"Delete unused category {category['name']}?",
+        )
+        if not confirmed:
+            self.set_status("Delete cancelled.")
+            return
+
+        try:
+            delete_category(category["id"])
+        except ValueError as exc:
+            self.set_status(str(exc))
+            return
+
+        self.clear_category_form(reset_status=False)
+        self.refresh_all("Category deleted.")
 
     def backup_data(self):
         default_name = f"expense-tracker-backup-{date.today().isoformat()}.db"

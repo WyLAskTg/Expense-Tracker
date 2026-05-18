@@ -9,6 +9,16 @@ from pathlib import Path
 APP_NAME = "PersonalExpenseTracker"
 DB_NAME = "expense_tracker.db"
 VALID_TYPES = {"income", "expense"}
+DEFAULT_CATEGORY_COLORS = (
+    "#b42318",
+    "#2f6f8f",
+    "#9a6700",
+    "#18794e",
+    "#8250df",
+    "#57606a",
+    "#0969da",
+    "#1f883d",
+)
 
 
 def _app_data_dir():
@@ -63,6 +73,48 @@ def _today():
 def _table_columns(cursor):
     cursor.execute("PRAGMA table_info(Records)")
     return {row["name"] for row in cursor.fetchall()}
+
+
+def _category_color(name):
+    total = sum(ord(char) for char in name)
+    return DEFAULT_CATEGORY_COLORS[total % len(DEFAULT_CATEGORY_COLORS)]
+
+
+def _ensure_category(cursor, name, color=None, default_budget_cents=0):
+    name = name.strip()
+    if not name:
+        return
+
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO Categories
+            (name, color, default_budget_cents, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (name, color or _category_color(name), default_budget_cents, _now(), _now()),
+    )
+
+
+def _sync_categories(cursor):
+    cursor.execute(
+        """
+        SELECT DISTINCT category
+        FROM Records
+        WHERE category IS NOT NULL AND TRIM(category) != ''
+        """
+    )
+    names = {row["category"] for row in cursor.fetchall()}
+    cursor.execute(
+        """
+        SELECT DISTINCT category
+        FROM Budgets
+        WHERE category IS NOT NULL AND TRIM(category) != ''
+        """
+    )
+    names.update(row["category"] for row in cursor.fetchall())
+
+    for name in sorted(names, key=str.casefold):
+        _ensure_category(cursor, name)
 
 
 def _migrate_records_table(cursor):
@@ -130,6 +182,19 @@ def database_init():
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS Categories(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                color TEXT NOT NULL,
+                default_budget_cents INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        _sync_categories(cursor)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_date ON Records(date)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_category ON Records(category)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_budgets_month ON Budgets(month)")
@@ -147,6 +212,7 @@ def insert_record(record_type, category, amount_cents, note, record_date):
 
     with _connect() as db:
         cursor = db.cursor()
+        _ensure_category(cursor, category)
         cursor.execute(
             """
             INSERT INTO Records
@@ -173,6 +239,7 @@ def update_record(record_id, record_type, category, amount_cents, note, record_d
 
     with _connect() as db:
         cursor = db.cursor()
+        _ensure_category(cursor, category)
         cursor.execute(
             """
             UPDATE Records
@@ -233,15 +300,122 @@ def load_records(month=None, category=None, search=None):
 def get_categories():
     with _connect() as db:
         cursor = db.cursor()
+        _sync_categories(cursor)
+        db.commit()
         cursor.execute(
             """
-            SELECT DISTINCT category
-            FROM Records
-            WHERE category IS NOT NULL AND TRIM(category) != ''
-            ORDER BY category COLLATE NOCASE
+            SELECT name
+            FROM Categories
+            ORDER BY name COLLATE NOCASE
             """
         )
-        return [row["category"] for row in cursor.fetchall()]
+        return [row["name"] for row in cursor.fetchall()]
+
+
+def load_categories():
+    with _connect() as db:
+        cursor = db.cursor()
+        _sync_categories(cursor)
+        db.commit()
+        cursor.execute(
+            """
+            SELECT
+                Categories.id,
+                Categories.name,
+                Categories.color,
+                Categories.default_budget_cents,
+                (
+                    SELECT COUNT(*)
+                    FROM Records
+                    WHERE Records.category = Categories.name
+                ) AS record_count,
+                (
+                    SELECT COUNT(*)
+                    FROM Budgets
+                    WHERE Budgets.category = Categories.name
+                ) AS budget_count
+            FROM Categories
+            ORDER BY Categories.name COLLATE NOCASE
+            """
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def save_category(name, color=None, default_budget_cents=0, category_id=None):
+    name = name.strip()
+    if not name:
+        raise ValueError("Category name must be non-empty.")
+
+    color = (color or _category_color(name)).strip()
+    now = _now()
+
+    with _connect() as db:
+        cursor = db.cursor()
+        if category_id is None:
+            cursor.execute(
+                """
+                INSERT INTO Categories (name, color, default_budget_cents, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(name)
+                DO UPDATE SET
+                    color = excluded.color,
+                    default_budget_cents = excluded.default_budget_cents,
+                    updated_at = excluded.updated_at
+                """,
+                (name, color, default_budget_cents, now, now),
+            )
+            db.commit()
+            cursor.execute("SELECT id FROM Categories WHERE name = ?", (name,))
+            return cursor.fetchone()["id"]
+
+        cursor.execute("SELECT name FROM Categories WHERE id = ?", (category_id,))
+        row = cursor.fetchone()
+        if row is None:
+            raise ValueError("Category was not found.")
+
+        old_name = row["name"]
+        try:
+            cursor.execute(
+                """
+                UPDATE Categories
+                SET name = ?, color = ?, default_budget_cents = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (name, color, default_budget_cents, now, category_id),
+            )
+            cursor.execute("UPDATE Records SET category = ? WHERE category = ?", (name, old_name))
+            cursor.execute("UPDATE Budgets SET category = ? WHERE category = ?", (name, old_name))
+            db.commit()
+        except sqlite3.IntegrityError as exc:
+            db.rollback()
+            raise ValueError("Category name conflicts with existing data.") from exc
+        return category_id
+
+
+def delete_category(category_id):
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT name FROM Categories WHERE id = ?", (category_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return 0
+
+        name = row["name"]
+        cursor.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM Records WHERE category = ?) AS record_count,
+                (SELECT COUNT(*) FROM Budgets WHERE category = ?) AS budget_count
+            """,
+            (name, name),
+        )
+        usage = cursor.fetchone()
+        if usage["record_count"] or usage["budget_count"]:
+            raise ValueError("Only unused categories can be deleted.")
+
+        cursor.execute("DELETE FROM Categories WHERE id = ?", (category_id,))
+        db.commit()
+        return cursor.rowcount
 
 
 def get_months():
@@ -300,10 +474,14 @@ def load_category_spending(month=None):
         cursor = db.cursor()
         cursor.execute(
             f"""
-            SELECT category, SUM(amount_cents) AS spent_cents
+            SELECT
+                Records.category,
+                SUM(Records.amount_cents) AS spent_cents,
+                Categories.color AS color
             FROM Records
+            LEFT JOIN Categories ON Categories.name = Records.category
             WHERE {' AND '.join(clauses)}
-            GROUP BY category
+            GROUP BY Records.category
             ORDER BY spent_cents DESC, category COLLATE NOCASE
             """,
             params,
@@ -340,6 +518,7 @@ def upsert_budget(month, category, amount_cents):
 
     with _connect() as db:
         cursor = db.cursor()
+        _ensure_category(cursor, category)
         cursor.execute(
             """
             INSERT INTO Budgets (month, category, amount_cents, created_at, updated_at)
