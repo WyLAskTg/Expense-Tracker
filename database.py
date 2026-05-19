@@ -3,14 +3,17 @@ import shutil
 import sqlite3
 from calendar import monthrange
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
+
+from crypto_utils import decrypt_file, encrypt_file
 
 
 APP_NAME = "PersonalExpenseTracker"
 DB_NAME = "expense_tracker.db"
 VALID_TYPES = {"income", "expense"}
 DEFAULT_ACCOUNT = "Cash"
+RECURRING_FREQUENCIES = {"daily", "weekly", "monthly", "yearly"}
 DEFAULT_CATEGORY_COLORS = (
     "#b42318",
     "#2f6f8f",
@@ -48,10 +51,19 @@ def get_db_path():
     db_path = data_dir / DB_NAME
 
     legacy_path = Path(__file__).resolve().parent / DB_NAME
-    if not db_path.exists() and legacy_path.exists():
+    encrypted_path = db_path.with_suffix(db_path.suffix + ".enc")
+    if not db_path.exists() and not encrypted_path.exists() and legacy_path.exists():
         shutil.copy2(legacy_path, db_path)
 
     return db_path
+
+
+def get_encrypted_db_path():
+    return get_db_path().with_suffix(get_db_path().suffix + ".enc")
+
+
+def encrypted_database_exists():
+    return get_encrypted_db_path().exists()
 
 
 @contextmanager
@@ -74,6 +86,11 @@ def _today():
 
 def _table_columns(cursor):
     cursor.execute("PRAGMA table_info(Records)")
+    return {row["name"] for row in cursor.fetchall()}
+
+
+def _columns_for_table(cursor, table_name):
+    cursor.execute(f"PRAGMA table_info({table_name})")
     return {row["name"] for row in cursor.fetchall()}
 
 
@@ -142,6 +159,47 @@ def _sync_accounts(cursor):
     names.add(DEFAULT_ACCOUNT)
     for name in sorted(names, key=str.casefold):
         _ensure_account(cursor, name)
+
+
+def _migrate_accounts_table(cursor):
+    columns = _columns_for_table(cursor, "Accounts")
+    if "opening_balance_cents" not in columns:
+        cursor.execute("ALTER TABLE Accounts ADD COLUMN opening_balance_cents INTEGER NOT NULL DEFAULT 0")
+
+
+def _migrate_transfers_table(cursor):
+    columns = _columns_for_table(cursor, "Transfers")
+    if "created_at" not in columns:
+        cursor.execute("ALTER TABLE Transfers ADD COLUMN created_at TEXT")
+    if "updated_at" not in columns:
+        cursor.execute("ALTER TABLE Transfers ADD COLUMN updated_at TEXT")
+
+    now = _now()
+    cursor.execute(
+        "UPDATE Transfers SET created_at = ? WHERE created_at IS NULL OR created_at = ''",
+        (now,),
+    )
+    cursor.execute(
+        "UPDATE Transfers SET updated_at = ? WHERE updated_at IS NULL OR updated_at = ''",
+        (now,),
+    )
+
+
+def _migrate_recurring_rules_table(cursor):
+    columns = _columns_for_table(cursor, "RecurringRules")
+    if "frequency" not in columns:
+        cursor.execute("ALTER TABLE RecurringRules ADD COLUMN frequency TEXT NOT NULL DEFAULT 'monthly'")
+    if "interval_count" not in columns:
+        cursor.execute("ALTER TABLE RecurringRules ADD COLUMN interval_count INTEGER NOT NULL DEFAULT 1")
+    if "start_date" not in columns:
+        cursor.execute("ALTER TABLE RecurringRules ADD COLUMN start_date TEXT")
+    if "end_date" not in columns:
+        cursor.execute("ALTER TABLE RecurringRules ADD COLUMN end_date TEXT")
+    if "last_generated_date" not in columns:
+        cursor.execute("ALTER TABLE RecurringRules ADD COLUMN last_generated_date TEXT")
+
+    cursor.execute("UPDATE RecurringRules SET frequency = 'monthly' WHERE frequency IS NULL OR TRIM(frequency) = ''")
+    cursor.execute("UPDATE RecurringRules SET interval_count = 1 WHERE interval_count IS NULL OR interval_count < 1")
 
 
 def _migrate_records_table(cursor):
@@ -233,11 +291,29 @@ def database_init():
             CREATE TABLE IF NOT EXISTS Accounts(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
+                opening_balance_cents INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        _migrate_accounts_table(cursor)
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS Transfers(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                from_account TEXT NOT NULL,
+                to_account TEXT NOT NULL,
+                amount REAL NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        _migrate_transfers_table(cursor)
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS RecurringRules(
@@ -249,13 +325,19 @@ def database_init():
                 amount_cents INTEGER NOT NULL,
                 note TEXT,
                 day_of_month INTEGER NOT NULL,
+                frequency TEXT NOT NULL DEFAULT 'monthly',
+                interval_count INTEGER NOT NULL DEFAULT 1,
+                start_date TEXT,
+                end_date TEXT,
                 last_generated_month TEXT,
+                last_generated_date TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        _migrate_recurring_rules_table(cursor)
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS Settings(
@@ -269,6 +351,9 @@ def database_init():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_date ON Records(date)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_category ON Records(category)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_account ON Records(account)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_transfers_date ON Transfers(date)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_transfers_from_account ON Transfers(from_account)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_transfers_to_account ON Transfers(to_account)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_budgets_month ON Budgets(month)")
         db.commit()
 
@@ -278,7 +363,15 @@ def _validate_type(record_type):
         raise ValueError(f"Invalid record type: {record_type}")
 
 
-def insert_record(record_type, category, amount_cents, note, record_date, account=DEFAULT_ACCOUNT):
+def insert_record(
+    record_type,
+    category,
+    amount_cents,
+    note,
+    record_date,
+    account=DEFAULT_ACCOUNT,
+    record_id=None,
+):
     _validate_type(record_type)
     now = _now()
 
@@ -286,24 +379,45 @@ def insert_record(record_type, category, amount_cents, note, record_date, accoun
         cursor = db.cursor()
         _ensure_category(cursor, category)
         _ensure_account(cursor, account)
-        cursor.execute(
-            """
-            INSERT INTO Records
-                (date, type, category, account, amount, amount_cents, note, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                record_date,
-                record_type,
-                category,
-                account,
-                amount_cents / 100,
-                amount_cents,
-                note,
-                now,
-                now,
-            ),
-        )
+        if record_id is None:
+            cursor.execute(
+                """
+                INSERT INTO Records
+                    (date, type, category, account, amount, amount_cents, note, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record_date,
+                    record_type,
+                    category,
+                    account,
+                    amount_cents / 100,
+                    amount_cents,
+                    note,
+                    now,
+                    now,
+                ),
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO Records
+                    (id, date, type, category, account, amount, amount_cents, note, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record_id,
+                    record_date,
+                    record_type,
+                    category,
+                    account,
+                    amount_cents / 100,
+                    amount_cents,
+                    note,
+                    now,
+                    now,
+                ),
+            )
         db.commit()
         return cursor.lastrowid
 
@@ -407,16 +521,200 @@ def get_accounts():
         return [row["name"] for row in cursor.fetchall()]
 
 
-def save_account(name):
+def save_account(name, opening_balance_cents=None, account_id=None):
     name = (name or DEFAULT_ACCOUNT).strip()
     if not name:
         raise ValueError("Account name must be non-empty.")
+    now = _now()
     with _connect() as db:
         cursor = db.cursor()
-        _ensure_account(cursor, name)
+        if account_id is None:
+            _ensure_account(cursor, name)
+            if opening_balance_cents is not None:
+                cursor.execute(
+                    """
+                    UPDATE Accounts
+                    SET opening_balance_cents = ?, updated_at = ?
+                    WHERE name = ?
+                    """,
+                    (opening_balance_cents, now, name),
+                )
+            db.commit()
+            cursor.execute("SELECT id FROM Accounts WHERE name = ?", (name,))
+            return cursor.fetchone()["id"]
+
+        cursor.execute("SELECT name FROM Accounts WHERE id = ?", (account_id,))
+        row = cursor.fetchone()
+        if row is None:
+            raise ValueError("Account was not found.")
+
+        old_name = row["name"]
+        try:
+            cursor.execute(
+                """
+                UPDATE Accounts
+                SET name = ?,
+                    opening_balance_cents = COALESCE(?, opening_balance_cents),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (name, opening_balance_cents, now, account_id),
+            )
+            cursor.execute("UPDATE Records SET account = ? WHERE account = ?", (name, old_name))
+            cursor.execute("UPDATE RecurringRules SET account = ? WHERE account = ?", (name, old_name))
+            cursor.execute("UPDATE Transfers SET from_account = ? WHERE from_account = ?", (name, old_name))
+            cursor.execute("UPDATE Transfers SET to_account = ? WHERE to_account = ?", (name, old_name))
+            db.commit()
+        except sqlite3.IntegrityError as exc:
+            db.rollback()
+            raise ValueError("Account name conflicts with existing data.") from exc
+        return account_id
+
+
+def load_accounts_detail():
+    with _connect() as db:
+        cursor = db.cursor()
+        _sync_accounts(cursor)
         db.commit()
-        cursor.execute("SELECT id FROM Accounts WHERE name = ?", (name,))
-        return cursor.fetchone()["id"]
+        cursor.execute(
+            """
+            SELECT
+                Accounts.id,
+                Accounts.name,
+                Accounts.opening_balance_cents,
+                COALESCE(SUM(CASE WHEN Records.type = 'income' THEN Records.amount_cents ELSE 0 END), 0) AS income_cents,
+                COALESCE(SUM(CASE WHEN Records.type = 'expense' THEN Records.amount_cents ELSE 0 END), 0) AS expense_cents,
+                COUNT(Records.id) AS record_count
+            FROM Accounts
+            LEFT JOIN Records ON Records.account = Accounts.name
+            GROUP BY Accounts.id, Accounts.name, Accounts.opening_balance_cents
+            ORDER BY Accounts.name COLLATE NOCASE
+            """
+        )
+        accounts = [dict(row) for row in cursor.fetchall()]
+
+        cursor.execute(
+            """
+            SELECT to_account AS account, COALESCE(SUM(amount_cents), 0) AS transfer_in_cents
+            FROM Transfers
+            GROUP BY to_account
+            """
+        )
+        transfer_in = {row["account"]: int(row["transfer_in_cents"] or 0) for row in cursor.fetchall()}
+        cursor.execute(
+            """
+            SELECT from_account AS account, COALESCE(SUM(amount_cents), 0) AS transfer_out_cents
+            FROM Transfers
+            GROUP BY from_account
+            """
+        )
+        transfer_out = {row["account"]: int(row["transfer_out_cents"] or 0) for row in cursor.fetchall()}
+
+    for account in accounts:
+        name = account["name"]
+        account["transfer_in_cents"] = transfer_in.get(name, 0)
+        account["transfer_out_cents"] = transfer_out.get(name, 0)
+        account["balance_cents"] = (
+            int(account["opening_balance_cents"] or 0)
+            + int(account["income_cents"] or 0)
+            - int(account["expense_cents"] or 0)
+            + account["transfer_in_cents"]
+            - account["transfer_out_cents"]
+        )
+    return accounts
+
+
+def load_account_balances():
+    return load_accounts_detail()
+
+
+def insert_transfer(transfer_date, from_account, to_account, amount_cents, note=""):
+    from_account = (from_account or "").strip()
+    to_account = (to_account or "").strip()
+    if not from_account or not to_account:
+        raise ValueError("Transfer accounts must be non-empty.")
+    if from_account == to_account:
+        raise ValueError("Transfer accounts must be different.")
+    if int(amount_cents) <= 0:
+        raise ValueError("Transfer amount must be positive.")
+
+    now = _now()
+    with _connect() as db:
+        cursor = db.cursor()
+        _ensure_account(cursor, from_account)
+        _ensure_account(cursor, to_account)
+        cursor.execute(
+            """
+            INSERT INTO Transfers
+                (date, from_account, to_account, amount, amount_cents, note, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transfer_date,
+                from_account,
+                to_account,
+                amount_cents / 100,
+                amount_cents,
+                note,
+                now,
+                now,
+            ),
+        )
+        db.commit()
+        return cursor.lastrowid
+
+
+def load_transfers(limit=None):
+    limit_clause = "LIMIT ?" if limit else ""
+    params = [limit] if limit else []
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute(
+            f"""
+            SELECT id, date, from_account, to_account, amount_cents, note, created_at, updated_at
+            FROM Transfers
+            ORDER BY date DESC, id DESC
+            {limit_clause}
+            """,
+            params,
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def delete_transfer(transfer_id):
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM Transfers WHERE id = ?", (transfer_id,))
+        db.commit()
+        return cursor.rowcount
+
+
+def restore_transfer(transfer):
+    with _connect() as db:
+        cursor = db.cursor()
+        _ensure_account(cursor, transfer["from_account"])
+        _ensure_account(cursor, transfer["to_account"])
+        now = _now()
+        cursor.execute(
+            """
+            INSERT INTO Transfers
+                (id, date, from_account, to_account, amount, amount_cents, note, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transfer.get("id"),
+                transfer["date"],
+                transfer["from_account"],
+                transfer["to_account"],
+                int(transfer["amount_cents"]) / 100,
+                int(transfer["amount_cents"]),
+                transfer.get("note") or "",
+                now,
+                now,
+            ),
+        )
+        db.commit()
+        return cursor.lastrowid
 
 
 def load_categories():
@@ -707,18 +1005,95 @@ def delete_record(record_id):
         return cursor.rowcount
 
 
+def restore_record(record):
+    return insert_record(
+        record["type"],
+        record["category"],
+        int(record["amount_cents"]),
+        record.get("note") or "",
+        record["date"],
+        account=record.get("account") or DEFAULT_ACCOUNT,
+        record_id=record.get("id"),
+    )
+
+
+def _parse_date(value):
+    if not value:
+        return None
+    return datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def _date_with_day(year, month, day):
+    return date(year, month, min(int(day), monthrange(year, month)[1]))
+
+
+def _add_months(value, months, day=None):
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    return _date_with_day(year, month, day or value.day)
+
+
+def _add_period(value, frequency, interval_count, day_of_month):
+    interval_count = max(int(interval_count or 1), 1)
+    if frequency == "daily":
+        return value + timedelta(days=interval_count)
+    if frequency == "weekly":
+        return value + timedelta(weeks=interval_count)
+    if frequency == "yearly":
+        return _add_months(value, interval_count * 12, day_of_month)
+    return _add_months(value, interval_count, day_of_month)
+
+
+def next_recurring_due_date(rule, today=None):
+    if not int(rule.get("active", 1)):
+        return None
+
+    today = today or date.today()
+    frequency = (rule.get("frequency") or "monthly").lower()
+    if frequency not in RECURRING_FREQUENCIES:
+        frequency = "monthly"
+    interval_count = max(int(rule.get("interval_count") or 1), 1)
+    day_of_month = int(rule.get("day_of_month") or today.day)
+    end_date = _parse_date(rule.get("end_date"))
+
+    last_generated = _parse_date(rule.get("last_generated_date"))
+    if last_generated is None and rule.get("last_generated_month"):
+        year, month = (int(part) for part in rule["last_generated_month"].split("-", 1))
+        last_generated = _date_with_day(year, month, day_of_month)
+
+    if last_generated is not None:
+        candidate = _add_period(last_generated, frequency, interval_count, day_of_month)
+    else:
+        start_date = _parse_date(rule.get("start_date"))
+        if start_date is not None:
+            candidate = start_date
+        elif frequency in {"monthly", "yearly"}:
+            candidate = _date_with_day(today.year, today.month, day_of_month)
+        else:
+            candidate = today
+
+    if end_date and candidate > end_date:
+        return None
+    return candidate.isoformat()
+
+
 def load_recurring_rules():
     with _connect() as db:
         cursor = db.cursor()
         cursor.execute(
             """
             SELECT id, name, type, category, account, amount_cents, note,
-                   day_of_month, last_generated_month, active, created_at, updated_at
+                   day_of_month, frequency, interval_count, start_date, end_date,
+                   last_generated_month, last_generated_date, active, created_at, updated_at
             FROM RecurringRules
             ORDER BY active DESC, name COLLATE NOCASE
             """
         )
-        return [dict(row) for row in cursor.fetchall()]
+        rows = [dict(row) for row in cursor.fetchall()]
+    for row in rows:
+        row["next_due_date"] = next_recurring_due_date(row)
+    return rows
 
 
 def upsert_recurring_rule(
@@ -729,12 +1104,20 @@ def upsert_recurring_rule(
     amount_cents,
     note,
     day_of_month,
+    frequency="monthly",
+    interval_count=1,
+    start_date=None,
+    end_date=None,
     active=True,
     rule_id=None,
 ):
     _validate_type(record_type)
     if not 1 <= int(day_of_month) <= 31:
         raise ValueError("Day of month must be between 1 and 31.")
+    frequency = (frequency or "monthly").lower()
+    if frequency not in RECURRING_FREQUENCIES:
+        raise ValueError("Invalid recurring frequency.")
+    interval_count = max(int(interval_count or 1), 1)
 
     now = _now()
     with _connect() as db:
@@ -746,8 +1129,8 @@ def upsert_recurring_rule(
                 """
                 INSERT INTO RecurringRules
                     (name, type, category, account, amount_cents, note, day_of_month,
-                     active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     frequency, interval_count, start_date, end_date, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
@@ -757,6 +1140,10 @@ def upsert_recurring_rule(
                     amount_cents,
                     note,
                     int(day_of_month),
+                    frequency,
+                    interval_count,
+                    start_date or None,
+                    end_date or None,
                     1 if active else 0,
                     now,
                     now,
@@ -769,7 +1156,8 @@ def upsert_recurring_rule(
             """
             UPDATE RecurringRules
             SET name = ?, type = ?, category = ?, account = ?, amount_cents = ?,
-                note = ?, day_of_month = ?, active = ?, updated_at = ?
+                note = ?, day_of_month = ?, frequency = ?, interval_count = ?,
+                start_date = ?, end_date = ?, active = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -780,6 +1168,10 @@ def upsert_recurring_rule(
                 amount_cents,
                 note,
                 int(day_of_month),
+                frequency,
+                interval_count,
+                start_date or None,
+                end_date or None,
                 1 if active else 0,
                 now,
                 rule_id,
@@ -799,7 +1191,6 @@ def delete_recurring_rule(rule_id):
 
 def generate_due_recurring_records(today=None):
     today = today or date.today()
-    month = today.strftime("%Y-%m")
     generated = 0
 
     with _connect() as db:
@@ -809,43 +1200,54 @@ def generate_due_recurring_records(today=None):
             SELECT *
             FROM RecurringRules
             WHERE active = 1
-              AND (last_generated_month IS NULL OR last_generated_month < ?)
-            """,
-            (month,),
+            """
         )
         rules = cursor.fetchall()
 
         for rule in rules:
-            due_day = min(int(rule["day_of_month"]), monthrange(today.year, today.month)[1])
-            if today.day < due_day:
-                continue
+            rule_dict = dict(rule)
+            while True:
+                due_date_text = next_recurring_due_date(rule_dict, today=today)
+                if due_date_text is None:
+                    break
+                due_date = _parse_date(due_date_text)
+                if due_date > today:
+                    break
 
-            due_date = date(today.year, today.month, due_day).isoformat()
-            _ensure_category(cursor, rule["category"])
-            _ensure_account(cursor, rule["account"])
-            cursor.execute(
-                """
-                INSERT INTO Records
-                    (date, type, category, account, amount, amount_cents, note, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    due_date,
-                    rule["type"],
-                    rule["category"],
-                    rule["account"],
-                    rule["amount_cents"] / 100,
-                    rule["amount_cents"],
-                    rule["note"] or rule["name"],
-                    _now(),
-                    _now(),
-                ),
-            )
-            cursor.execute(
-                "UPDATE RecurringRules SET last_generated_month = ?, updated_at = ? WHERE id = ?",
-                (month, _now(), rule["id"]),
-            )
-            generated += 1
+                _ensure_category(cursor, rule["category"])
+                _ensure_account(cursor, rule["account"])
+                cursor.execute(
+                    """
+                    INSERT INTO Records
+                        (date, type, category, account, amount, amount_cents, note, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        due_date_text,
+                        rule["type"],
+                        rule["category"],
+                        rule["account"],
+                        rule["amount_cents"] / 100,
+                        rule["amount_cents"],
+                        rule["note"] or rule["name"],
+                        _now(),
+                        _now(),
+                    ),
+                )
+                cursor.execute(
+                    """
+                    UPDATE RecurringRules
+                    SET last_generated_month = ?, last_generated_date = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (due_date.strftime("%Y-%m"), due_date_text, _now(), rule["id"]),
+                )
+                rule_dict["last_generated_month"] = due_date.strftime("%Y-%m")
+                rule_dict["last_generated_date"] = due_date_text
+                generated += 1
+
+                if generated > 250:
+                    break
 
         db.commit()
     return generated
@@ -856,6 +1258,28 @@ def backup_database(destination_path):
     destination = Path(destination_path).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(get_db_path(), destination)
+    return destination
+
+
+def encrypt_database(password, remove_plaintext=False):
+    database_init()
+    source = get_db_path()
+    destination = get_encrypted_db_path()
+    encrypt_file(source, destination, password)
+    if remove_plaintext:
+        source.unlink(missing_ok=True)
+    return destination
+
+
+def decrypt_database(password):
+    source = get_encrypted_db_path()
+    if not source.exists():
+        return None
+
+    destination = get_db_path()
+    decrypt_file(source, destination, password)
+    validate_database_file(destination)
+    database_init()
     return destination
 
 

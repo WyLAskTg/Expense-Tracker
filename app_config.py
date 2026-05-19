@@ -1,8 +1,9 @@
 from pathlib import Path
 
 
-APP_VERSION = "v25.5.3"
+APP_VERSION = "v26.5.3.1"
 APP_ICON = "assets/app.ico"
+GITHUB_REPO = "WyLAskTg/Expense-Tracker"
 DEFAULT_LANGUAGE = "en"
 DEFAULT_ACCOUNT = "Cash"
 CURRENT_BACKUP_KEEP = 7
