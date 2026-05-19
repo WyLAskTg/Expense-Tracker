@@ -1,5 +1,5 @@
 #define MyAppName "Expense Tracker"
-#define MyAppVersion "26.5.4"
+#define MyAppVersion "26.5.4A"
 #define MyAppPublisher "WyLAskTg"
 #define MyAppExeName "Expense Tracker.exe"
 

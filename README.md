@@ -121,4 +121,4 @@ py -3 -m unittest discover -s tests
 
 ## Automated Builds
 
-GitHub Actions builds a Windows executable and an Inno Setup installer on pushes to `main`, pull requests, and manual workflow runs. Tag a commit with a version like `v26.5.4` to create a GitHub Release with both assets.
+GitHub Actions builds a Windows executable and an Inno Setup installer on pushes to `main`, pull requests, and manual workflow runs. Tag a commit with a version like `v26.5.4A` to create a GitHub Release with both assets.

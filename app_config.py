@@ -1,7 +1,7 @@
 from pathlib import Path
 
 
-APP_VERSION = "v26.5.4"
+APP_VERSION = "v26.5.4A"
 APP_ICON = "assets/app.ico"
 GITHUB_REPO = "WyLAskTg/Expense-Tracker"
 DEFAULT_LANGUAGE = "en"
