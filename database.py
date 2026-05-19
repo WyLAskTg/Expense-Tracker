@@ -1,6 +1,8 @@
+import json
 import os
 import shutil
 import sqlite3
+import zipfile
 from calendar import monthrange
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -64,6 +66,30 @@ def get_encrypted_db_path():
 
 def encrypted_database_exists():
     return get_encrypted_db_path().exists()
+
+
+def get_attachments_dir():
+    folder = get_db_path().parent / "attachments"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def store_attachment(source_path):
+    source = Path(source_path).expanduser().resolve()
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(source)
+
+    destination_dir = get_attachments_dir()
+    safe_stem = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in source.stem).strip("_")
+    safe_stem = safe_stem or "attachment"
+    suffix = source.suffix.lower()
+    destination = destination_dir / f"{safe_stem}{suffix}"
+    counter = 1
+    while destination.exists():
+        destination = destination_dir / f"{safe_stem}-{counter}{suffix}"
+        counter += 1
+    shutil.copy2(source, destination)
+    return destination
 
 
 @contextmanager
@@ -371,15 +397,47 @@ def database_init():
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ClassificationRules(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                keyword TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'expense',
+                category TEXT NOT NULL,
+                account TEXT NOT NULL DEFAULT 'Cash',
+                tags TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(keyword, type)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS AuditLog(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                record_id INTEGER,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         _sync_categories(cursor)
         _sync_accounts(cursor)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_date ON Records(date)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_category ON Records(category)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_account ON Records(account)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_type ON Records(type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_amount ON Records(amount_cents)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_records_tags ON Records(tags)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_transfers_date ON Transfers(date)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_transfers_from_account ON Transfers(from_account)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_transfers_to_account ON Transfers(to_account)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_budgets_month ON Budgets(month)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON AuditLog(created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_rules_keyword ON ClassificationRules(keyword)")
         db.commit()
 
 
@@ -503,7 +561,7 @@ def update_record(
         return cursor.rowcount
 
 
-def load_records(
+def _record_filter_sql(
     month=None,
     category=None,
     account=None,
@@ -550,6 +608,39 @@ def load_records(
         params.extend([f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%"])
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    return where, params
+
+
+def load_records(
+    month=None,
+    category=None,
+    account=None,
+    tag=None,
+    record_type=None,
+    search=None,
+    date_from=None,
+    date_to=None,
+    amount_min_cents=None,
+    amount_max_cents=None,
+    limit=None,
+    offset=0,
+):
+    where, params = _record_filter_sql(
+        month=month,
+        category=category,
+        account=account,
+        tag=tag,
+        record_type=record_type,
+        search=search,
+        date_from=date_from,
+        date_to=date_to,
+        amount_min_cents=amount_min_cents,
+        amount_max_cents=amount_max_cents,
+    )
+    paging = ""
+    if limit is not None:
+        paging = "LIMIT ? OFFSET ?"
+        params = [*params, int(limit), int(offset or 0)]
 
     with _connect() as db:
         cursor = db.cursor()
@@ -559,10 +650,42 @@ def load_records(
             FROM Records
             {where}
             ORDER BY date DESC, id DESC
+            {paging}
             """,
             params,
         )
         return [dict(row) for row in cursor.fetchall()]
+
+
+def count_records(
+    month=None,
+    category=None,
+    account=None,
+    tag=None,
+    record_type=None,
+    search=None,
+    date_from=None,
+    date_to=None,
+    amount_min_cents=None,
+    amount_max_cents=None,
+):
+    where, params = _record_filter_sql(
+        month=month,
+        category=category,
+        account=account,
+        tag=tag,
+        record_type=record_type,
+        search=search,
+        date_from=date_from,
+        date_to=date_to,
+        amount_min_cents=amount_min_cents,
+        amount_max_cents=amount_max_cents,
+    )
+
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute(f"SELECT COUNT(*) AS total FROM Records {where}", params)
+        return int(cursor.fetchone()["total"] or 0)
 
 
 def get_categories():
@@ -1165,6 +1288,210 @@ def restore_record(record):
     )
 
 
+def log_activity(action, detail="", record_id=None):
+    action = (action or "").strip()
+    if not action:
+        return None
+    database_init()
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute(
+            """
+            INSERT INTO AuditLog (action, detail, record_id, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (action, detail or "", record_id, _now()),
+        )
+        db.commit()
+        return cursor.lastrowid
+
+
+def load_activity_logs(limit=100):
+    database_init()
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute(
+            """
+            SELECT id, action, detail, record_id, created_at
+            FROM AuditLog
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(limit or 100),),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def save_classification_rule(
+    keyword,
+    record_type,
+    category,
+    account=DEFAULT_ACCOUNT,
+    tags="",
+    active=True,
+    rule_id=None,
+):
+    keyword = (keyword or "").strip().lower()
+    category = (category or "").strip()
+    account = (account or DEFAULT_ACCOUNT).strip() or DEFAULT_ACCOUNT
+    tags = ",".join(tag.strip().lower() for tag in (tags or "").split(",") if tag.strip())
+    _validate_type(record_type)
+    if not keyword:
+        raise ValueError("Keyword must be non-empty.")
+    if not category:
+        raise ValueError("Category must be non-empty.")
+
+    now = _now()
+    with _connect() as db:
+        cursor = db.cursor()
+        _ensure_category(cursor, category)
+        _ensure_account(cursor, account)
+        if rule_id is None:
+            cursor.execute(
+                """
+                INSERT INTO ClassificationRules
+                    (keyword, type, category, account, tags, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(keyword, type)
+                DO UPDATE SET
+                    category = excluded.category,
+                    account = excluded.account,
+                    tags = excluded.tags,
+                    active = excluded.active,
+                    updated_at = excluded.updated_at
+                """,
+                (keyword, record_type, category, account, tags, 1 if active else 0, now, now),
+            )
+            cursor.execute(
+                "SELECT id FROM ClassificationRules WHERE keyword = ? AND type = ?",
+                (keyword, record_type),
+            )
+            saved_id = cursor.fetchone()["id"]
+        else:
+            cursor.execute(
+                """
+                UPDATE ClassificationRules
+                SET keyword = ?, type = ?, category = ?, account = ?, tags = ?, active = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (keyword, record_type, category, account, tags, 1 if active else 0, now, rule_id),
+            )
+            saved_id = rule_id
+        db.commit()
+        return saved_id
+
+
+def load_classification_rules(active_only=False):
+    database_init()
+    where = "WHERE active = 1" if active_only else ""
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute(
+            f"""
+            SELECT id, keyword, type, category, account, tags, active, created_at, updated_at
+            FROM ClassificationRules
+            {where}
+            ORDER BY active DESC, keyword COLLATE NOCASE
+            """
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def delete_classification_rule(rule_id):
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM ClassificationRules WHERE id = ?", (rule_id,))
+        db.commit()
+        return cursor.rowcount
+
+
+def match_classification_rule(text, record_type="expense"):
+    haystack = (text or "").lower()
+    if not haystack:
+        return None
+    rules = load_classification_rules(active_only=True)
+    matching = [
+        rule
+        for rule in rules
+        if (not record_type or rule["type"] == record_type) and rule["keyword"].lower() in haystack
+    ]
+    if not matching:
+        return None
+    matching.sort(key=lambda rule: len(rule["keyword"]), reverse=True)
+    return matching[0]
+
+
+def split_record(record_id, splits):
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute(
+            """
+            SELECT id, date, type, category, account, amount_cents, note, tags, attachment_path
+            FROM Records
+            WHERE id = ?
+            """,
+            (record_id,),
+        )
+        original = cursor.fetchone()
+        if original is None:
+            raise ValueError("Record was not found.")
+
+        cleaned = []
+        for item in splits:
+            category = (item.get("category") or "").strip()
+            amount_cents = int(item.get("amount_cents") or 0)
+            if not category or amount_cents <= 0:
+                raise ValueError("Each split needs a category and positive amount.")
+            cleaned.append(
+                {
+                    "category": category,
+                    "amount_cents": amount_cents,
+                    "note": (item.get("note") or original["note"] or "").strip(),
+                    "tags": (item.get("tags") or original["tags"] or "").strip(),
+                }
+            )
+        if not cleaned:
+            raise ValueError("At least one split line is required.")
+        if sum(item["amount_cents"] for item in cleaned) != int(original["amount_cents"]):
+            raise ValueError("Split amounts must equal the original amount.")
+
+        now = _now()
+        new_ids = []
+        for item in cleaned:
+            _ensure_category(cursor, item["category"])
+            cursor.execute(
+                """
+                INSERT INTO Records
+                    (date, type, category, account, amount, amount_cents, note, tags, attachment_path, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    original["date"],
+                    original["type"],
+                    item["category"],
+                    original["account"],
+                    item["amount_cents"] / 100,
+                    item["amount_cents"],
+                    item["note"],
+                    item["tags"],
+                    original["attachment_path"] or "",
+                    now,
+                    now,
+                ),
+            )
+            new_ids.append(cursor.lastrowid)
+        cursor.execute("DELETE FROM Records WHERE id = ?", (record_id,))
+        cursor.execute(
+            """
+            INSERT INTO AuditLog (action, detail, record_id, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("split_record", f"Split record #{record_id} into {len(new_ids)} records.", record_id, now),
+        )
+        db.commit()
+        return {"original": dict(original), "new_ids": new_ids}
+
+
 def find_duplicate_records():
     with _connect() as db:
         cursor = db.cursor()
@@ -1478,8 +1805,43 @@ def backup_database(destination_path):
     database_init()
     destination = Path(destination_path).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
+    validate_database_file(get_db_path())
     shutil.copy2(get_db_path(), destination)
     return destination
+
+
+def create_backup_archive(destination_path):
+    database_init()
+    source = validate_database_file(get_db_path())
+    destination = Path(destination_path).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "app": APP_NAME,
+        "created_at": _now(),
+        "database": source.name,
+        "integrity": "ok",
+    }
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(source, arcname=source.name)
+        archive.writestr("manifest.json", json.dumps(manifest, indent=2))
+    return destination
+
+
+def restore_backup_archive(source_path):
+    source = Path(source_path).expanduser().resolve()
+    if not source.exists():
+        raise FileNotFoundError(source)
+    with zipfile.ZipFile(source, "r") as archive:
+        candidates = [name for name in archive.namelist() if name.lower().endswith(".db")]
+        if not candidates:
+            raise ValueError("Backup archive does not contain a database file.")
+        extracted = get_db_path().parent / "_restore_candidate.db"
+        with archive.open(candidates[0]) as src, open(extracted, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    try:
+        return restore_database(extracted)
+    finally:
+        extracted.unlink(missing_ok=True)
 
 
 def encrypt_database(password, remove_plaintext=False):
@@ -1514,6 +1876,7 @@ def run_auto_backup(keep=7, today=None):
     backup_dir = get_db_path().parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     destination = backup_dir / f"expense-tracker-auto-{today_text}.db"
+    validate_database_file(get_db_path())
     shutil.copy2(get_db_path(), destination)
 
     custom_backup_folder = get_setting("auto_backup_folder")

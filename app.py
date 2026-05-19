@@ -4,9 +4,11 @@ import os
 import sys
 import tkinter as tk
 import webbrowser
-from datetime import date
+import zipfile
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
+from xml.sax.saxutils import escape as xml_escape
 
 from app_config import (
     APP_ICON,
@@ -22,9 +24,12 @@ from database import (
     archive_account,
     backup_database,
     cleanup_tags,
+    count_records,
+    create_backup_archive,
     database_init,
     delete_budget,
     delete_category,
+    delete_classification_rule,
     delete_record,
     delete_recurring_rule,
     delete_transfer,
@@ -34,6 +39,7 @@ from database import (
     find_duplicate_records,
     generate_due_recurring_records,
     get_accounts,
+    get_attachments_dir,
     get_categories,
     get_db_path,
     get_months,
@@ -42,29 +48,38 @@ from database import (
     load_account_spending,
     load_account_balances,
     load_accounts_detail,
+    load_activity_logs,
     load_budgets,
     load_budget_alerts,
     load_budget_progress,
     load_categories,
+    load_classification_rules,
     load_category_spending,
     load_monthly_summary,
     load_recurring_rules,
     load_records,
     load_transfers,
+    log_activity,
+    match_classification_rule,
     merge_account_records,
     merge_category_records,
     next_recurring_due_date,
     restore_database,
+    restore_backup_archive,
     restore_record,
     restore_transfer,
     run_auto_backup,
     save_account as save_account_record,
     save_category,
+    save_classification_rule,
     set_setting,
+    split_record,
+    store_attachment,
     insert_transfer,
     update_record,
     upsert_recurring_rule,
     upsert_budget,
+    validate_database_file,
 )
 from i18n import LANGUAGES, translate
 from record_utils import (
@@ -101,9 +116,14 @@ class ExpenseTrackerApp:
         self.account_details = []
         self.transfers = []
         self.recurring_rules = []
+        self.classification_rules = []
+        self.activity_logs = []
         self.undo_stack = []
         self.nav_buttons = {}
         self.hover_item = None
+        self.record_page = 0
+        self.record_page_size = 100
+        self.record_total_count = 0
         self.category_chart_data = []
         self.monthly_chart_data = []
         self.account_chart_data = []
@@ -120,6 +140,7 @@ class ExpenseTrackerApp:
         self.editing_category_id = None
         self.editing_account_id = None
         self.editing_recurring_id = None
+        self.editing_rule_id = None
         self.startup_messages = []
         self.encryption_password = None
 
@@ -331,8 +352,12 @@ class ExpenseTrackerApp:
             row=0, column=3, sticky="e", padx=(0, 12)
         )
 
+        ttk.Button(header, text=self.t("quick_add"), style="Primary.TButton", command=self.open_quick_entry).grid(
+            row=0, column=4, sticky="e", padx=(0, 12)
+        )
+
         self.version_label = ttk.Label(header, text=APP_VERSION)
-        self.version_label.grid(row=0, column=4, sticky="e")
+        self.version_label.grid(row=0, column=5, sticky="e")
 
     def build_sidebar(self):
         sidebar = ttk.Frame(self.root, padding=(12, 0, 8, 8))
@@ -556,6 +581,12 @@ class ExpenseTrackerApp:
         ttk.Button(editor, text=self.t("open_attachment"), command=self.open_attachment).grid(
             row=3, column=6, sticky="ew", padx=(0, 8), pady=(3, 0)
         )
+        ttk.Button(editor, text=self.t("apply_rule"), command=self.apply_classification_to_form).grid(
+            row=3, column=7, sticky="ew", padx=(0, 8), pady=(3, 0)
+        )
+        ttk.Button(editor, text=self.t("open_attachment_folder"), command=self.open_attachment_folder).grid(
+            row=3, column=8, sticky="ew", pady=(3, 0)
+        )
 
     def build_record_filters(self):
         filters = ttk.Frame(self.records_tab, padding=(10, 0, 10, 8))
@@ -598,7 +629,7 @@ class ExpenseTrackerApp:
             row=0, column=7, sticky="w", padx=(6, 14)
         )
 
-        ttk.Button(filters, text=self.t("apply"), command=lambda: self.refresh_records()).grid(
+        ttk.Button(filters, text=self.t("apply"), command=self.apply_record_filters).grid(
             row=0, column=9, sticky="e", padx=(0, 8)
         )
         ttk.Button(filters, text=self.t("reset"), command=self.reset_filters).grid(
@@ -688,12 +719,17 @@ class ExpenseTrackerApp:
 
         actions = ttk.Frame(table_frame)
         actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        actions.columnconfigure(3, weight=1)
+        actions.columnconfigure(5, weight=1)
 
         ttk.Button(actions, text=self.t("edit"), command=self.start_edit).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(actions, text=self.t("delete"), style="Danger.TButton", command=self.delete_selected).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(actions, text=self.t("export_csv"), command=self.export_csv).grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(actions, text=self.t("import_csv"), command=self.import_csv).grid(row=0, column=3)
+        ttk.Button(actions, text=self.t("split_record"), command=self.split_selected_record).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(actions, text=self.t("export_csv"), command=self.export_csv).grid(row=0, column=3, padx=(0, 8))
+        ttk.Button(actions, text=self.t("import_csv"), command=self.import_csv).grid(row=0, column=4, padx=(0, 8))
+        self.page_status_var = tk.StringVar(value="")
+        ttk.Button(actions, text=self.t("previous_page"), command=self.previous_record_page).grid(row=0, column=6, padx=(0, 8))
+        ttk.Label(actions, textvariable=self.page_status_var).grid(row=0, column=7, padx=(0, 8))
+        ttk.Button(actions, text=self.t("next_page"), command=self.next_record_page).grid(row=0, column=8)
 
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.tree.bind("<Double-1>", lambda event: self.start_edit())
@@ -716,6 +752,12 @@ class ExpenseTrackerApp:
         self.report_month_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
         ttk.Button(controls, text=self.t("refresh"), command=lambda: self.refresh_reports()).grid(
             row=0, column=2, sticky="w"
+        )
+        ttk.Button(controls, text=self.t("export_excel"), command=self.export_report_xlsx).grid(
+            row=0, column=3, sticky="w", padx=(8, 0)
+        )
+        ttk.Button(controls, text=self.t("export_pdf"), command=self.export_report_pdf).grid(
+            row=0, column=4, sticky="w", padx=(8, 0)
         )
 
         metrics = ttk.Frame(self.reports_tab, padding=(10, 0, 10, 8))
@@ -770,12 +812,22 @@ class ExpenseTrackerApp:
 
         editor = ttk.LabelFrame(self.budgets_tab, text=self.t("monthly_budget"), padding=12)
         editor.grid(row=0, column=0, padx=10, pady=(10, 8), sticky="ew")
-        for column in range(7):
+        for column in range(10):
             editor.columnconfigure(column, weight=1)
 
         self.budget_month_var = tk.StringVar(value=CURRENT_MONTH)
         self.budget_category_var = tk.StringVar()
         self.budget_amount_var = tk.StringVar()
+        self.budget_rollover_var = tk.BooleanVar(value=get_setting("budget_rollover_enabled") == "1")
+        try:
+            annual_target_cents = int(get_setting("annual_budget_target_cents", "0") or 0)
+        except ValueError:
+            annual_target_cents = 0
+        self.annual_budget_target_var = tk.StringVar(
+            value=amount_entry_text(annual_target_cents)
+            if annual_target_cents
+            else ""
+        )
 
         ttk.Label(editor, text=self.t("month")).grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.budget_month_combo = ttk.Combobox(editor, textvariable=self.budget_month_var, width=10)
@@ -799,6 +851,19 @@ class ExpenseTrackerApp:
         ttk.Button(editor, text=self.t("delete"), style="Danger.TButton", command=self.delete_selected_budget).grid(
             row=1, column=5, sticky="ew", pady=(3, 0)
         )
+        ttk.Checkbutton(
+            editor,
+            text=self.t("rollover_budget"),
+            variable=self.budget_rollover_var,
+            command=self.save_budget_options,
+        ).grid(row=1, column=6, sticky="w", padx=(10, 8), pady=(3, 0))
+        ttk.Label(editor, text=self.t("annual_target")).grid(row=0, column=7, sticky="w", padx=(0, 6))
+        ttk.Entry(editor, textvariable=self.annual_budget_target_var, width=12).grid(
+            row=1, column=7, sticky="ew", padx=(0, 8), pady=(3, 0)
+        )
+        ttk.Button(editor, text=self.t("save_options"), command=self.save_budget_options).grid(
+            row=1, column=8, sticky="ew", pady=(3, 0)
+        )
 
         self.budget_summary_var = tk.StringVar(value="")
         ttk.Label(self.budgets_tab, textvariable=self.budget_summary_var, padding=(10, 0, 10, 8)).grid(
@@ -810,16 +875,18 @@ class ExpenseTrackerApp:
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
 
-        columns = ("category", "budget", "spent", "remaining", "usage")
+        columns = ("category", "budget", "rollover", "spent", "remaining", "usage")
         self.budget_tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
         self.budget_tree.heading("category", text=self.t("category"))
         self.budget_tree.heading("budget", text=self.t("budget"))
+        self.budget_tree.heading("rollover", text=self.t("rollover"))
         self.budget_tree.heading("spent", text=self.t("spent"))
         self.budget_tree.heading("remaining", text=self.t("remaining"))
         self.budget_tree.heading("usage", text=self.t("usage"))
 
         self.budget_tree.column("category", width=180, minwidth=130, anchor="w")
         self.budget_tree.column("budget", width=120, minwidth=100, anchor="e")
+        self.budget_tree.column("rollover", width=110, minwidth=90, anchor="e")
         self.budget_tree.column("spent", width=120, minwidth=100, anchor="e")
         self.budget_tree.column("remaining", width=120, minwidth=100, anchor="e")
         self.budget_tree.column("usage", width=100, minwidth=80, anchor="e")
@@ -1231,8 +1298,25 @@ class ExpenseTrackerApp:
 
     def build_tools_tab(self):
         self.tools_tab.columnconfigure(0, weight=1)
+        self.tools_tab.rowconfigure(0, weight=1)
 
-        settings_frame = ttk.LabelFrame(self.tools_tab, text=self.t("settings"), padding=12)
+        tools_canvas = tk.Canvas(self.tools_tab, highlightthickness=0, background=self.palette["background"])
+        tools_scroll = ttk.Scrollbar(self.tools_tab, orient="vertical", command=tools_canvas.yview)
+        tools_content = ttk.Frame(tools_canvas)
+        tools_content.columnconfigure(0, weight=1)
+        tools_window = tools_canvas.create_window((0, 0), window=tools_content, anchor="nw")
+        tools_canvas.configure(yscrollcommand=tools_scroll.set)
+        tools_canvas.grid(row=0, column=0, sticky="nsew")
+        tools_scroll.grid(row=0, column=1, sticky="ns")
+
+        def sync_scroll_region(event=None):
+            tools_canvas.configure(scrollregion=tools_canvas.bbox("all"))
+            tools_canvas.itemconfigure(tools_window, width=tools_canvas.winfo_width())
+
+        tools_content.bind("<Configure>", sync_scroll_region)
+        tools_canvas.bind("<Configure>", sync_scroll_region)
+
+        settings_frame = ttk.LabelFrame(tools_content, text=self.t("settings"), padding=12)
         settings_frame.grid(row=0, column=0, padx=10, pady=(10, 8), sticky="ew")
         settings_frame.columnconfigure(1, weight=1)
         settings_frame.columnconfigure(3, weight=1)
@@ -1304,7 +1388,7 @@ class ExpenseTrackerApp:
             row=2, column=4, sticky="w", padx=(8, 0), pady=(12, 0)
         )
 
-        data_frame = ttk.LabelFrame(self.tools_tab, text=self.t("data"), padding=12)
+        data_frame = ttk.LabelFrame(tools_content, text=self.t("data"), padding=12)
         data_frame.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="ew")
         data_frame.columnconfigure(1, weight=1)
 
@@ -1332,8 +1416,17 @@ class ExpenseTrackerApp:
         ttk.Button(data_frame, text=self.t("clear"), command=self.clear_auto_backup_folder).grid(
             row=2, column=3, sticky="w", padx=(8, 0), pady=(12, 0)
         )
+        ttk.Button(data_frame, text=self.t("backup_archive"), command=self.backup_archive).grid(
+            row=3, column=0, sticky="w", pady=(12, 0)
+        )
+        ttk.Button(data_frame, text=self.t("verify_database"), command=self.verify_database).grid(
+            row=3, column=1, sticky="w", padx=(8, 0), pady=(12, 0)
+        )
+        ttk.Button(data_frame, text=self.t("open_attachment_folder"), command=self.open_attachment_folder).grid(
+            row=3, column=2, sticky="w", padx=(8, 0), pady=(12, 0)
+        )
 
-        quality_frame = ttk.LabelFrame(self.tools_tab, text=self.t("data_quality"), padding=12)
+        quality_frame = ttk.LabelFrame(tools_content, text=self.t("data_quality"), padding=12)
         quality_frame.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="ew")
         quality_frame.columnconfigure(1, weight=1)
         quality_frame.columnconfigure(3, weight=1)
@@ -1378,6 +1471,103 @@ class ExpenseTrackerApp:
         )
         ttk.Label(quality_frame, textvariable=self.data_quality_status_var).grid(
             row=3, column=0, columnspan=4, sticky="ew", pady=(12, 0)
+        )
+
+        rules_frame = ttk.LabelFrame(tools_content, text=self.t("auto_classification"), padding=12)
+        rules_frame.grid(row=3, column=0, padx=10, pady=(0, 10), sticky="ew")
+        for column in range(8):
+            rules_frame.columnconfigure(column, weight=1)
+
+        self.rule_keyword_var = tk.StringVar()
+        self.rule_type_var = tk.StringVar(value="expense")
+        self.rule_category_var = tk.StringVar()
+        self.rule_account_var = tk.StringVar(value=DEFAULT_ACCOUNT)
+        self.rule_tags_var = tk.StringVar()
+        self.rule_active_var = tk.BooleanVar(value=True)
+
+        ttk.Label(rules_frame, text=self.t("keyword")).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(rules_frame, textvariable=self.rule_keyword_var, width=18).grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        ttk.Label(rules_frame, text=self.t("type")).grid(row=0, column=1, sticky="w", padx=(0, 6))
+        ttk.Combobox(
+            rules_frame,
+            textvariable=self.rule_type_var,
+            values=TYPE_OPTIONS,
+            state="readonly",
+            width=10,
+        ).grid(row=1, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(rules_frame, text=self.t("category")).grid(row=0, column=2, sticky="w", padx=(0, 6))
+        self.rule_category_combo = ttk.Combobox(rules_frame, textvariable=self.rule_category_var, width=16)
+        self.rule_category_combo.grid(row=1, column=2, sticky="ew", padx=(0, 8))
+        ttk.Label(rules_frame, text=self.t("account")).grid(row=0, column=3, sticky="w", padx=(0, 6))
+        self.rule_account_combo = ttk.Combobox(rules_frame, textvariable=self.rule_account_var, width=14)
+        self.rule_account_combo.grid(row=1, column=3, sticky="ew", padx=(0, 8))
+        ttk.Label(rules_frame, text=self.t("tags")).grid(row=0, column=4, sticky="w", padx=(0, 6))
+        ttk.Entry(rules_frame, textvariable=self.rule_tags_var, width=14).grid(row=1, column=4, sticky="ew", padx=(0, 8))
+        ttk.Checkbutton(rules_frame, text=self.t("active"), variable=self.rule_active_var).grid(
+            row=1, column=5, sticky="w", padx=(0, 8)
+        )
+        self.rule_save_button = ttk.Button(
+            rules_frame,
+            text=self.t("save_rule"),
+            style="Primary.TButton",
+            command=self.save_classification_rule_from_form,
+        )
+        self.rule_save_button.grid(row=1, column=6, sticky="ew", padx=(0, 8))
+        ttk.Button(rules_frame, text=self.t("clear"), command=self.clear_classification_rule_form).grid(
+            row=1, column=7, sticky="ew"
+        )
+
+        self.rules_tree = ttk.Treeview(
+            rules_frame,
+            columns=("keyword", "type", "category", "account", "tags", "status"),
+            show="headings",
+            height=4,
+            selectmode="browse",
+        )
+        for column, label_key in (
+            ("keyword", "keyword"),
+            ("type", "type"),
+            ("category", "category"),
+            ("account", "account"),
+            ("tags", "tags"),
+            ("status", "status"),
+        ):
+            self.rules_tree.heading(column, text=self.t(label_key))
+        self.rules_tree.column("keyword", width=150, anchor="w")
+        self.rules_tree.column("type", width=90, anchor="w")
+        self.rules_tree.column("category", width=140, anchor="w")
+        self.rules_tree.column("account", width=120, anchor="w")
+        self.rules_tree.column("tags", width=160, anchor="w")
+        self.rules_tree.column("status", width=80, anchor="w")
+        self.rules_tree.grid(row=2, column=0, columnspan=7, sticky="ew", pady=(10, 0))
+        ttk.Button(rules_frame, text=self.t("delete"), style="Danger.TButton", command=self.delete_selected_classification_rule).grid(
+            row=2, column=7, sticky="nw", pady=(10, 0)
+        )
+        self.rules_tree.bind("<<TreeviewSelect>>", self.on_classification_rule_select)
+
+        activity_frame = ttk.LabelFrame(tools_content, text=self.t("activity_log"), padding=12)
+        activity_frame.grid(row=4, column=0, padx=10, pady=(0, 10), sticky="ew")
+        activity_frame.columnconfigure(0, weight=1)
+        self.activity_tree = ttk.Treeview(
+            activity_frame,
+            columns=("created_at", "action", "record_id", "detail"),
+            show="headings",
+            height=5,
+        )
+        for column, label_key in (
+            ("created_at", "date"),
+            ("action", "action"),
+            ("record_id", "record"),
+            ("detail", "detail"),
+        ):
+            self.activity_tree.heading(column, text=self.t(label_key))
+        self.activity_tree.column("created_at", width=150, anchor="w")
+        self.activity_tree.column("action", width=130, anchor="w")
+        self.activity_tree.column("record_id", width=80, anchor="e")
+        self.activity_tree.column("detail", width=520, anchor="w")
+        self.activity_tree.grid(row=0, column=0, sticky="ew")
+        ttk.Button(activity_frame, text=self.t("refresh"), command=self.refresh_activity_log).grid(
+            row=1, column=0, sticky="w", pady=(8, 0)
         )
 
     def build_status_bar(self):
@@ -1428,6 +1618,10 @@ class ExpenseTrackerApp:
             elif action["type"] == "import_records":
                 for record_id in action["record_ids"]:
                     delete_record(record_id)
+            elif action["type"] == "split_record":
+                for record_id in action["new_ids"]:
+                    delete_record(record_id)
+                restore_record(action["original"])
             elif action["type"] == "delete_transfer":
                 restore_transfer(action["transfer"])
             else:
@@ -1450,6 +1644,8 @@ class ExpenseTrackerApp:
         self.refresh_categories(update_status=False)
         self.refresh_accounts(update_status=False)
         self.refresh_recurring(update_status=False)
+        self.refresh_classification_rules(update_status=False)
+        self.refresh_activity_log(update_status=False)
         self.update_picker_options()
 
     def update_picker_options(self):
@@ -1478,6 +1674,10 @@ class ExpenseTrackerApp:
         if hasattr(self, "merge_account_source_combo"):
             self.merge_account_source_combo.configure(values=accounts)
             self.merge_account_target_combo.configure(values=accounts)
+        if hasattr(self, "rule_category_combo"):
+            self.rule_category_combo.configure(values=categories)
+        if hasattr(self, "rule_account_combo"):
+            self.rule_account_combo.configure(values=accounts)
 
     def save_current_tab(self):
         current = self.notebook.select()
@@ -1508,6 +1708,82 @@ class ExpenseTrackerApp:
             self.clear_recurring_form()
         else:
             self.set_status(self.t("nothing_to_clear"))
+
+    def open_quick_entry(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title(self.t("quick_add"))
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        quick_date = tk.StringVar(value=date.today().isoformat())
+        quick_type = tk.StringVar(value="expense")
+        quick_category = tk.StringVar()
+        quick_account = tk.StringVar(value=DEFAULT_ACCOUNT)
+        quick_amount = tk.StringVar()
+        quick_note = tk.StringVar()
+
+        fields = ttk.Frame(dialog, padding=12)
+        fields.grid(row=0, column=0, sticky="nsew")
+        for column in range(2):
+            fields.columnconfigure(column, weight=1)
+
+        ttk.Label(fields, text=self.t("date")).grid(row=0, column=0, sticky="w")
+        ttk.Entry(fields, textvariable=quick_date, width=14).grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(3, 8))
+        ttk.Label(fields, text=self.t("type")).grid(row=0, column=1, sticky="w")
+        ttk.Combobox(fields, textvariable=quick_type, values=TYPE_OPTIONS, state="readonly", width=12).grid(
+            row=1, column=1, sticky="ew", pady=(3, 8)
+        )
+        ttk.Label(fields, text=self.t("category")).grid(row=2, column=0, sticky="w")
+        category_combo = ttk.Combobox(fields, textvariable=quick_category, values=get_categories(), width=18)
+        category_combo.grid(row=3, column=0, sticky="ew", padx=(0, 8), pady=(3, 8))
+        ttk.Label(fields, text=self.t("account")).grid(row=2, column=1, sticky="w")
+        ttk.Combobox(fields, textvariable=quick_account, values=get_accounts(), width=18).grid(
+            row=3, column=1, sticky="ew", pady=(3, 8)
+        )
+        ttk.Label(fields, text=self.t("amount")).grid(row=4, column=0, sticky="w")
+        amount_entry = ttk.Entry(fields, textvariable=quick_amount, width=14)
+        amount_entry.grid(row=5, column=0, sticky="ew", padx=(0, 8), pady=(3, 8))
+        ttk.Label(fields, text=self.t("note")).grid(row=4, column=1, sticky="w")
+        ttk.Entry(fields, textvariable=quick_note, width=24).grid(row=5, column=1, sticky="ew", pady=(3, 8))
+
+        actions = ttk.Frame(fields)
+        actions.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        actions.columnconfigure(0, weight=1)
+
+        def apply_rule():
+            rule = match_classification_rule(quick_note.get(), quick_type.get())
+            if rule:
+                quick_category.set(rule["category"])
+                quick_account.set(rule["account"] or DEFAULT_ACCOUNT)
+
+        def save():
+            apply_rule()
+            try:
+                record_date = parse_record_date(quick_date.get())
+                amount_cents = amount_to_cents(quick_amount.get())
+                category = quick_category.get().strip()
+                if not category:
+                    raise ValueError("Category must be non-empty.")
+                record_id = insert_record(
+                    quick_type.get(),
+                    category,
+                    amount_cents,
+                    quick_note.get().strip(),
+                    record_date,
+                    account=quick_account.get().strip() or DEFAULT_ACCOUNT,
+                )
+            except ValueError as exc:
+                messagebox.showerror(self.t("quick_add"), str(exc), parent=dialog)
+                return
+            log_activity("quick_add", f"{category} {self.money_text(amount_cents)}", record_id)
+            dialog.destroy()
+            self.refresh_all(self.t("record_added"))
+
+        ttk.Button(actions, text=self.t("apply_rule"), command=apply_rule).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(actions, text=self.t("save"), style="Primary.TButton", command=save).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(actions, text=self.t("cancel"), command=dialog.destroy).grid(row=0, column=3)
+        amount_entry.focus_set()
 
     def refresh_dashboard(self, update_status=True):
         month = CURRENT_MONTH
@@ -1633,7 +1909,7 @@ class ExpenseTrackerApp:
             self.set_status(str(exc))
             return
 
-        self.records = load_records(
+        self.record_total_count = count_records(
             month=month,
             category=category,
             account=account,
@@ -1645,10 +1921,44 @@ class ExpenseTrackerApp:
             amount_min_cents=amount_min,
             amount_max_cents=amount_max,
         )
+        max_page = max((self.record_total_count - 1) // self.record_page_size, 0)
+        self.record_page = min(max(self.record_page, 0), max_page)
+        self.records = load_records(
+            month=month,
+            category=category,
+            account=account,
+            tag=tag,
+            record_type=record_type,
+            search=search,
+            date_from=date_from,
+            date_to=date_to,
+            amount_min_cents=amount_min,
+            amount_max_cents=amount_max,
+            limit=self.record_page_size,
+            offset=self.record_page * self.record_page_size,
+        )
         self.populate_table()
         self.update_summary()
         self.update_picker_options()
-        self.set_status(status_message or f"{self.t('count')}: {len(self.records)}")
+        if hasattr(self, "page_status_var"):
+            start = self.record_page * self.record_page_size + 1 if self.record_total_count else 0
+            end = min((self.record_page + 1) * self.record_page_size, self.record_total_count)
+            self.page_status_var.set(f"{start}-{end} / {self.record_total_count}")
+        self.set_status(status_message or f"{self.t('count')}: {len(self.records)} / {self.record_total_count}")
+
+    def apply_record_filters(self):
+        self.record_page = 0
+        self.refresh_records()
+
+    def previous_record_page(self):
+        if self.record_page > 0:
+            self.record_page -= 1
+            self.refresh_records(self.t("page_changed"))
+
+    def next_record_page(self):
+        if (self.record_page + 1) * self.record_page_size < self.record_total_count:
+            self.record_page += 1
+            self.refresh_records(self.t("page_changed"))
 
     def populate_table(self):
         for item in self.tree.get_children():
@@ -1724,6 +2034,12 @@ class ExpenseTrackerApp:
         note = self.note_var.get().strip()
         tags = ",".join(tag.strip().lower() for tag in self.tags_var.get().split(",") if tag.strip())
         attachment_path = self.attachment_var.get().strip()
+        suggestion = match_classification_rule(" ".join([note, category, tags]), record_type)
+        if suggestion:
+            category = category or suggestion["category"]
+            if (not account or account == DEFAULT_ACCOUNT) and suggestion.get("account"):
+                account = suggestion["account"]
+            tags = tags or suggestion.get("tags") or ""
 
         if record_type not in TYPE_OPTIONS:
             raise ValueError("Type must be income or expense.")
@@ -1732,7 +2048,39 @@ class ExpenseTrackerApp:
         if not account:
             raise ValueError("Account must be non-empty.")
 
+        attachment_path = self.localize_attachment_path(attachment_path)
+
         return record_type, category, account, amount_cents, note, tags, attachment_path, record_date
+
+    def apply_classification_to_form(self):
+        text = " ".join([self.note_var.get(), self.category_var.get(), self.tags_var.get()])
+        rule = match_classification_rule(text, self.type_var.get())
+        if not rule:
+            self.set_status(self.t("no_rule_match"))
+            return
+        if not self.category_var.get().strip():
+            self.category_var.set(rule["category"])
+        if not self.account_var.get().strip() or self.account_var.get().strip() == DEFAULT_ACCOUNT:
+            self.account_var.set(rule["account"] or DEFAULT_ACCOUNT)
+        if rule.get("tags") and not self.tags_var.get().strip():
+            self.tags_var.set(rule["tags"])
+        self.set_status(self.t("rule_applied"))
+
+    def localize_attachment_path(self, path):
+        if not path:
+            return ""
+        source = Path(path).expanduser()
+        try:
+            attachments_dir = get_attachments_dir().resolve()
+            resolved = source.resolve()
+        except OSError:
+            return path
+        if not resolved.exists() or attachments_dir in resolved.parents:
+            return str(resolved) if resolved.exists() else path
+        try:
+            return str(store_attachment(resolved))
+        except OSError:
+            return path
 
     def save_record(self):
         try:
@@ -1742,7 +2090,7 @@ class ExpenseTrackerApp:
             return
 
         if self.editing_record_id is None:
-            insert_record(
+            record_id = insert_record(
                 record_type,
                 category,
                 amount_cents,
@@ -1752,6 +2100,7 @@ class ExpenseTrackerApp:
                 tags=tags,
                 attachment_path=attachment_path,
             )
+            log_activity("add_record", f"{category} {self.money_text(amount_cents)}", record_id)
             self.clear_form(reset_status=False)
             self.show_toast(self.t("record_added"))
             self.refresh_all(self.t("record_added"))
@@ -1768,6 +2117,8 @@ class ExpenseTrackerApp:
             tags=tags,
             attachment_path=attachment_path,
         )
+        if updated:
+            log_activity("update_record", f"{category} {self.money_text(amount_cents)}", self.editing_record_id)
         self.clear_form(reset_status=False)
         self.show_toast(self.t("record_updated") if updated else "Record was not found.")
         self.refresh_all(self.t("record_updated") if updated else "Record was not found.")
@@ -1813,7 +2164,13 @@ class ExpenseTrackerApp:
             filetypes=(("Documents and images", "*.pdf *.png *.jpg *.jpeg"), ("All files", "*.*")),
         )
         if path:
+            try:
+                path = str(store_attachment(path))
+            except OSError as exc:
+                self.set_status(f"{self.t('attachment_missing')}: {exc}")
+                return
             self.attachment_var.set(path)
+            self.set_status(self.t("attachment_saved"))
 
     def open_attachment(self):
         path = self.attachment_var.get().strip()
@@ -1832,6 +2189,13 @@ class ExpenseTrackerApp:
             os.startfile(attachment)
         else:
             webbrowser.open(attachment.as_uri())
+
+    def open_attachment_folder(self):
+        folder = get_attachments_dir()
+        if os.name == "nt":
+            os.startfile(folder)
+        else:
+            webbrowser.open(folder.as_uri())
 
     def on_record_table_motion(self, event):
         item = self.tree.identify_row(event.y)
@@ -1858,12 +2222,69 @@ class ExpenseTrackerApp:
             return
 
         delete_record(record["id"])
+        log_activity("delete_record", f"{record['category']} {self.money_text(record['amount_cents'])}", record["id"])
         self.push_undo({"type": "delete_record", "record": record})
         if self.editing_record_id == record["id"]:
             self.clear_form(reset_status=False)
         self.refresh_all(self.t("record_deleted"))
 
+    def split_selected_record(self):
+        record = self.selected_record()
+        if not record:
+            self.set_status("Select a record to split.")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(self.t("split_record"))
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("560x360")
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
+        result = {"done": False}
+
+        help_text = self.t("split_help", amount=self.money_text(record["amount_cents"]))
+        ttk.Label(dialog, text=help_text, padding=(12, 10)).grid(row=0, column=0, sticky="ew")
+        text = tk.Text(dialog, height=10, wrap="none")
+        text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 10))
+        text.insert("1.0", f"{record['category']},{amount_entry_text(record['amount_cents'])},{record.get('note') or ''},{record.get('tags') or ''}")
+
+        actions = ttk.Frame(dialog, padding=(12, 0, 12, 12))
+        actions.grid(row=2, column=0, sticky="ew")
+        actions.columnconfigure(0, weight=1)
+
+        def accept():
+            lines = [line.strip() for line in text.get("1.0", tk.END).splitlines() if line.strip()]
+            splits = []
+            try:
+                for line in lines:
+                    parts = [part.strip() for part in line.split(",", 3)]
+                    if len(parts) < 2:
+                        raise ValueError(self.t("split_invalid"))
+                    splits.append(
+                        {
+                            "category": parts[0],
+                            "amount_cents": amount_to_cents(parts[1]),
+                            "note": parts[2] if len(parts) > 2 else "",
+                            "tags": parts[3] if len(parts) > 3 else "",
+                        }
+                    )
+                outcome = split_record(record["id"], splits)
+            except ValueError as exc:
+                messagebox.showerror(self.t("split_record"), str(exc), parent=dialog)
+                return
+            self.push_undo({"type": "split_record", "original": outcome["original"], "new_ids": outcome["new_ids"]})
+            result["done"] = True
+            dialog.destroy()
+
+        ttk.Button(actions, text=self.t("confirm"), style="Primary.TButton", command=accept).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(actions, text=self.t("cancel"), command=dialog.destroy).grid(row=0, column=2)
+        self.root.wait_window(dialog)
+        if result["done"]:
+            self.refresh_all(self.t("record_split"))
+
     def reset_filters(self):
+        self.record_page = 0
         self.month_filter_var.set("")
         self.category_filter_var.set("")
         self.account_filter_var.set("")
@@ -1910,6 +2331,7 @@ class ExpenseTrackerApp:
                 )
 
         self.set_status(f"Exported {len(self.records)} record(s) to CSV.")
+        log_activity("export_csv", str(path))
 
     def import_csv(self):
         path = filedialog.askopenfilename(
@@ -1956,11 +2378,12 @@ class ExpenseTrackerApp:
                 record["date"],
                 account=record.get("account") or DEFAULT_ACCOUNT,
                 tags=record.get("tags") or "",
-                attachment_path=record.get("attachment_path") or "",
+                attachment_path=self.localize_attachment_path(record.get("attachment_path") or ""),
             )
             inserted_ids.append(record_id)
 
         self.push_undo({"type": "import_records", "record_ids": inserted_ids})
+        log_activity("import_records", f"Imported {len(inserted_ids)} record(s).")
         self.refresh_all(f"Imported {len(records)} record(s).")
 
     def read_csv_records(self, path):
@@ -2211,6 +2634,144 @@ class ExpenseTrackerApp:
         self.update_picker_options()
         if update_status:
             self.set_status(self.t("reports_refreshed"))
+
+    def report_rows(self):
+        month = parse_month(self.report_month_var.get()) or CURRENT_MONTH
+        rows = [["Report Month", month], ["", ""]]
+        rows.append(["Category Spending", "Amount"])
+        rows.extend([[row["category"], amount_entry_text(row["spent_cents"])] for row in self.category_chart_data])
+        rows.append(["", ""])
+        rows.append(["Account Spending", "Amount"])
+        rows.extend([[row["account"], amount_entry_text(row["spent_cents"])] for row in self.account_chart_data])
+        rows.append(["", ""])
+        rows.append(["Budget Progress", "Budget", "Spent"])
+        rows.extend(
+            [[row["category"], amount_entry_text(row["budget_cents"]), amount_entry_text(row["spent_cents"])]
+             for row in self.budget_progress_data]
+        )
+        rows.append(["", ""])
+        rows.append(["Monthly Trend", "Income", "Expense"])
+        rows.extend(
+            [[row["month"], amount_entry_text(row["income_cents"]), amount_entry_text(row["expense_cents"])]
+             for row in self.monthly_chart_data]
+        )
+        return rows
+
+    def export_report_xlsx(self):
+        self.refresh_reports(update_status=False)
+        path = filedialog.asksaveasfilename(
+            title=self.t("export_excel"),
+            defaultextension=".xlsx",
+            initialfile=f"expense-report-{self.report_month_var.get() or CURRENT_MONTH}.xlsx",
+            filetypes=(("Excel workbook", "*.xlsx"), ("All files", "*.*")),
+        )
+        if not path:
+            self.set_status("Export cancelled.")
+            return
+        self.write_simple_xlsx(path, self.report_rows())
+        log_activity("export_excel", str(path))
+        self.set_status(self.t("report_exported"))
+
+    def write_simple_xlsx(self, path, rows):
+        def col_name(index):
+            name = ""
+            index += 1
+            while index:
+                index, remainder = divmod(index - 1, 26)
+                name = chr(65 + remainder) + name
+            return name
+
+        sheet_rows = []
+        for row_index, row in enumerate(rows, start=1):
+            cells = []
+            for col_index, value in enumerate(row):
+                cell = f"{col_name(col_index)}{row_index}"
+                cells.append(f'<c r="{cell}" t="inlineStr"><is><t>{xml_escape(str(value))}</t></is></c>')
+            sheet_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+        sheet_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f'<sheetData>{"".join(sheet_rows)}</sheetData></worksheet>'
+        )
+        workbook_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="Report" sheetId="1" r:id="rId1"/></sheets></workbook>'
+        )
+        rels_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            '</Relationships>'
+        )
+        workbook_rels_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            '</Relationships>'
+        )
+        content_types_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            '</Types>'
+        )
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("[Content_Types].xml", content_types_xml)
+            archive.writestr("_rels/.rels", rels_xml)
+            archive.writestr("xl/workbook.xml", workbook_xml)
+            archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+            archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+
+    def export_report_pdf(self):
+        self.refresh_reports(update_status=False)
+        path = filedialog.asksaveasfilename(
+            title=self.t("export_pdf"),
+            defaultextension=".pdf",
+            initialfile=f"expense-report-{self.report_month_var.get() or CURRENT_MONTH}.pdf",
+            filetypes=(("PDF file", "*.pdf"), ("All files", "*.*")),
+        )
+        if not path:
+            self.set_status("Export cancelled.")
+            return
+        lines = ["Expense Tracker Report"]
+        for row in self.report_rows():
+            lines.append("  ".join(str(value) for value in row if str(value)))
+        self.write_simple_pdf(path, lines[:45])
+        log_activity("export_pdf", str(path))
+        self.set_status(self.t("report_exported"))
+
+    def write_simple_pdf(self, path, lines):
+        def pdf_escape(value):
+            return str(value).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+        content_lines = ["BT", "/F1 11 Tf", "50 790 Td", "14 TL"]
+        for line in lines:
+            content_lines.append(f"({pdf_escape(line)}) Tj")
+            content_lines.append("T*")
+        content_lines.append("ET")
+        stream = "\n".join(content_lines).encode("latin-1", errors="replace")
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream",
+        ]
+        data = [b"%PDF-1.4\n"]
+        offsets = []
+        for index, obj in enumerate(objects, start=1):
+            offsets.append(sum(len(chunk) for chunk in data))
+            data.append(f"{index} 0 obj\n".encode("ascii") + obj + b"\nendobj\n")
+        xref_offset = sum(len(chunk) for chunk in data)
+        xref = [b"xref\n", f"0 {len(objects) + 1}\n".encode("ascii"), b"0000000000 65535 f \n"]
+        xref.extend(f"{offset:010d} 00000 n \n".encode("ascii") for offset in offsets)
+        trailer = f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode("ascii")
+        Path(path).write_bytes(b"".join(data + xref + [trailer]))
 
     def draw_category_chart(self):
         canvas = self.category_canvas
@@ -2478,19 +3039,25 @@ class ExpenseTrackerApp:
         self.budget_month_var.set(month)
         self.budgets = load_budgets(month=month)
         spending = {row["category"]: int(row["spent_cents"] or 0) for row in load_category_spending(month=month)}
+        rollover_enabled = self.budget_rollover_var.get() if hasattr(self, "budget_rollover_var") else False
+        rollover = self.calculate_budget_rollover(month) if rollover_enabled else {}
 
         for item in self.budget_tree.get_children():
             self.budget_tree.delete(item)
 
         total_budget = 0
+        total_rollover = 0
         total_spent = 0
         over_count = 0
 
         for budget in self.budgets:
             spent = spending.get(budget["category"], 0)
-            remaining = budget["amount_cents"] - spent
-            usage = spent / budget["amount_cents"] if budget["amount_cents"] else 0
+            rollover_cents = rollover.get(budget["category"], 0)
+            available = budget["amount_cents"] + rollover_cents
+            remaining = available - spent
+            usage = spent / available if available else 0
             total_budget += budget["amount_cents"]
+            total_rollover += rollover_cents
             total_spent += spent
             if remaining < 0:
                 tag = "over"
@@ -2507,6 +3074,7 @@ class ExpenseTrackerApp:
                 values=(
                     budget["category"],
                     self.money_text(budget["amount_cents"]),
+                    self.money_text(rollover_cents),
                     self.money_text(spent),
                     self.money_text(remaining),
                     f"{usage * 100:.0f}%",
@@ -2514,17 +3082,57 @@ class ExpenseTrackerApp:
                 tags=(tag,),
             )
 
+        annual_text = self.annual_budget_status_text()
         if self.budgets:
             self.budget_summary_var.set(
                 f"{month}: {self.t('spent')} {self.money_text(total_spent)} / "
-                f"{self.t('budget')} {self.money_text(total_budget)}; {over_count} over."
+                f"{self.t('budget')} {self.money_text(total_budget + total_rollover)}; {over_count} over. {annual_text}"
             )
         else:
-            self.budget_summary_var.set(f"{self.t('budgets')}: 0 ({month})")
+            self.budget_summary_var.set(f"{self.t('budgets')}: 0 ({month}) {annual_text}")
 
         self.update_picker_options()
         if update_status:
             self.set_status(self.t("budgets_refreshed"))
+
+    def previous_month(self, month):
+        parsed = datetime.strptime(month, "%Y-%m").date().replace(day=1)
+        previous = parsed - timedelta(days=1)
+        return previous.strftime("%Y-%m")
+
+    def calculate_budget_rollover(self, month):
+        previous = self.previous_month(month)
+        budgets = load_budget_progress(previous)
+        rollover = {}
+        for row in budgets:
+            remaining = int(row["budget_cents"] or 0) - int(row["spent_cents"] or 0)
+            if remaining > 0:
+                rollover[row["category"]] = remaining
+        return rollover
+
+    def annual_budget_status_text(self):
+        raw = get_setting("annual_budget_target_cents", "0") or "0"
+        try:
+            target = int(raw)
+        except ValueError:
+            target = 0
+        if target <= 0:
+            return ""
+        year = (parse_month(self.budget_month_var.get()) or CURRENT_MONTH)[:4]
+        rows = load_records(date_from=f"{year}-01-01", date_to=f"{year}-12-31", record_type="expense")
+        spent = sum(int(row["amount_cents"] or 0) for row in rows)
+        return f"{self.t('annual_target')}: {self.money_text(spent)} / {self.money_text(target)}"
+
+    def save_budget_options(self):
+        try:
+            annual_target = amount_to_cents(self.annual_budget_target_var.get()) if self.annual_budget_target_var.get().strip() else 0
+        except ValueError as exc:
+            self.set_status(str(exc))
+            return
+        set_setting("budget_rollover_enabled", "1" if self.budget_rollover_var.get() else "0")
+        set_setting("annual_budget_target_cents", str(annual_target))
+        self.refresh_budgets(update_status=False)
+        self.set_status(self.t("budget_options_saved"))
 
     def selected_budget(self):
         selected = self.budget_tree.selection()
@@ -3194,13 +3802,117 @@ class ExpenseTrackerApp:
         if tag and is_newer_version(tag, APP_VERSION):
             open_release = messagebox.askyesno(
                 self.t("update_available"),
-                self.t("update_available_detail", version=tag),
+                self.t("update_available_detail", version=tag) + "\n" + self.t("download_installer_prompt"),
             )
-            if open_release and release["url"]:
-                webbrowser.open(release["url"])
+            if open_release:
+                webbrowser.open(release.get("download_url") or release["url"])
             self.set_status(self.t("update_available_detail", version=tag))
         else:
             self.set_status(self.t("up_to_date"))
+
+    def refresh_classification_rules(self, update_status=True):
+        if not hasattr(self, "rules_tree"):
+            return
+        self.classification_rules = load_classification_rules()
+        for item in self.rules_tree.get_children():
+            self.rules_tree.delete(item)
+        for rule in self.classification_rules:
+            self.rules_tree.insert(
+                "",
+                tk.END,
+                iid=str(rule["id"]),
+                values=(
+                    rule["keyword"],
+                    self.type_text(rule["type"]),
+                    rule["category"],
+                    rule["account"],
+                    rule.get("tags") or "",
+                    self.t("active") if rule.get("active") else self.t("inactive"),
+                ),
+            )
+        if update_status:
+            self.set_status(self.t("rules_refreshed"))
+
+    def selected_classification_rule(self):
+        selected = self.rules_tree.selection() if hasattr(self, "rules_tree") else ()
+        if not selected:
+            return None
+        rule_id = int(selected[0])
+        return next((rule for rule in self.classification_rules if rule["id"] == rule_id), None)
+
+    def on_classification_rule_select(self, event=None):
+        rule = self.selected_classification_rule()
+        if not rule:
+            return
+        self.editing_rule_id = rule["id"]
+        self.rule_keyword_var.set(rule["keyword"])
+        self.rule_type_var.set(rule["type"])
+        self.rule_category_var.set(rule["category"])
+        self.rule_account_var.set(rule["account"])
+        self.rule_tags_var.set(rule.get("tags") or "")
+        self.rule_active_var.set(bool(rule.get("active")))
+        self.rule_save_button.configure(text=self.t("update_rule"))
+
+    def save_classification_rule_from_form(self):
+        try:
+            save_classification_rule(
+                self.rule_keyword_var.get(),
+                self.rule_type_var.get(),
+                self.rule_category_var.get(),
+                self.rule_account_var.get(),
+                self.rule_tags_var.get(),
+                active=self.rule_active_var.get(),
+                rule_id=self.editing_rule_id,
+            )
+        except ValueError as exc:
+            self.set_status(str(exc))
+            return
+        log_activity("save_rule", self.rule_keyword_var.get())
+        self.clear_classification_rule_form(reset_status=False)
+        self.refresh_classification_rules(update_status=False)
+        self.update_picker_options()
+        self.set_status(self.t("rule_saved"))
+
+    def clear_classification_rule_form(self, reset_status=True):
+        self.editing_rule_id = None
+        self.rule_keyword_var.set("")
+        self.rule_type_var.set("expense")
+        self.rule_category_var.set("")
+        self.rule_account_var.set(DEFAULT_ACCOUNT)
+        self.rule_tags_var.set("")
+        self.rule_active_var.set(True)
+        self.rule_save_button.configure(text=self.t("save_rule"))
+        if hasattr(self, "rules_tree"):
+            self.rules_tree.selection_remove(self.rules_tree.selection())
+        if reset_status:
+            self.set_status(self.t("form_cleared"))
+
+    def delete_selected_classification_rule(self):
+        rule = self.selected_classification_rule()
+        if not rule:
+            self.set_status("Select a rule first.")
+            return
+        delete_classification_rule(rule["id"])
+        log_activity("delete_rule", rule["keyword"])
+        self.clear_classification_rule_form(reset_status=False)
+        self.refresh_classification_rules(update_status=False)
+        self.set_status(self.t("rule_deleted"))
+
+    def refresh_activity_log(self, update_status=True):
+        if not hasattr(self, "activity_tree"):
+            return
+        self.activity_logs = load_activity_logs(limit=80)
+        for item in self.activity_tree.get_children():
+            self.activity_tree.delete(item)
+        for row in self.activity_logs:
+            self.activity_tree.insert(
+                "",
+                tk.END,
+                iid=str(row["id"]),
+                values=(row["created_at"], row["action"], row.get("record_id") or "", row.get("detail") or ""),
+            )
+        if update_status:
+            self.set_status(self.t("activity_refreshed"))
 
     def choose_auto_backup_folder(self):
         folder = filedialog.askdirectory(title=self.t("cloud_backup"), parent=self.root)
@@ -3244,6 +3956,7 @@ class ExpenseTrackerApp:
         except ValueError as exc:
             self.set_status(str(exc))
             return
+        log_activity("merge_category", f"{source} -> {target}")
         self.refresh_all(self.t("merge_done", count=sum(count.values())))
 
     def merge_account_from_tools(self):
@@ -3257,10 +3970,12 @@ class ExpenseTrackerApp:
         except ValueError as exc:
             self.set_status(str(exc))
             return
+        log_activity("merge_account", f"{source} -> {target}")
         self.refresh_all(self.t("merge_done", count=sum(count.values())))
 
     def cleanup_tags_from_tools(self):
         count = cleanup_tags()
+        log_activity("cleanup_tags", f"{count} record(s)")
         self.refresh_all(self.t("tags_cleaned", count=count))
 
     def backup_data(self):
@@ -3276,12 +3991,40 @@ class ExpenseTrackerApp:
             return
 
         destination = backup_database(path)
+        log_activity("backup_database", str(destination))
         self.set_status(f"Backup saved to {destination}.")
+
+    def backup_archive(self):
+        default_name = f"expense-tracker-backup-{date.today().isoformat()}.zip"
+        path = filedialog.asksaveasfilename(
+            title=self.t("backup_archive"),
+            defaultextension=".zip",
+            initialfile=default_name,
+            filetypes=(("ZIP archive", "*.zip"), ("All files", "*.*")),
+        )
+        if not path:
+            self.set_status("Backup cancelled.")
+            return
+        try:
+            destination = create_backup_archive(path)
+        except (OSError, ValueError) as exc:
+            self.set_status(str(exc))
+            return
+        log_activity("backup_archive", str(destination))
+        self.set_status(self.t("backup_archive_saved"))
+
+    def verify_database(self):
+        try:
+            validate_database_file(get_db_path())
+        except (OSError, ValueError) as exc:
+            self.set_status(str(exc))
+            return
+        self.set_status(self.t("database_verified"))
 
     def restore_data(self):
         path = filedialog.askopenfilename(
             title="Restore database",
-            filetypes=(("SQLite database", "*.db"), ("All files", "*.*")),
+            filetypes=(("Backup files", "*.db *.zip"), ("SQLite database", "*.db"), ("ZIP archive", "*.zip"), ("All files", "*.*")),
         )
         if not path:
             self.set_status("Restore cancelled.")
@@ -3296,12 +4039,13 @@ class ExpenseTrackerApp:
             return
 
         try:
-            destination = restore_database(path)
+            destination = restore_backup_archive(path) if path.lower().endswith(".zip") else restore_database(path)
         except (OSError, ValueError) as exc:
             messagebox.showerror("Restore failed", str(exc))
             self.set_status("Restore failed.")
             return
 
+        log_activity("restore_database", str(path))
         self.db_path_var.set(str(destination))
         self.clear_form(reset_status=False)
         self.clear_budget_form(reset_status=False)

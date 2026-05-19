@@ -8,15 +8,20 @@ A desktop expense tracker built with Python, Tkinter, and SQLite.
 - Store date, type, category, amount, note, tags, and receipt attachments
 - Track accounts or payment methods for each record
 - Edit and delete existing records
+- Split one transaction into multiple category lines
+- Use keyword rules to auto-fill category, account, and tags while recording expenses
 - Filter records by month, category, account, type, tag, date range, amount range, and search text
+- Browse large record sets with paged results
 - Display income, expense, balance, and record count summaries
 - Review a dashboard with this-month metrics, budget alerts, account balances, recent records, and upcoming recurring rules
 - View reports with category spending, account spending, budget progress, and 12-month trend charts
 - Hover and click report charts to inspect values and drill into matching filtered records
-- Set monthly budgets by category and compare budget vs. actual spending
+- Export reports to Excel or PDF
+- Set monthly budgets by category, optional rollover, and annual spending targets
 - Manage categories with colors and default monthly budgets
 - Manage account balances, account types, icons, archived accounts, and transfers without counting them as income or expense
 - Create recurring rules for daily, weekly, monthly, or yearly bills and income
+- Use a quick-add dialog for fast transaction entry
 - Export the current record view to CSV
 - Import records from CSV with field mapping, reusable templates, preview, and duplicate detection
 - Undo deleted records, deleted transfers, and recent CSV imports
@@ -24,9 +29,10 @@ A desktop expense tracker built with Python, Tkinter, and SQLite.
 - Choose a display currency for all money amounts
 - Switch between light and dark themes
 - Add an optional password lock and encrypted-at-rest local database vault
-- Check GitHub Releases for app updates from inside the app
+- Check GitHub Releases for app updates from inside the app and open the installer download
 - Create an automatic daily database backup, optionally copied to a folder you choose
-- Run data quality tools for duplicate checks, tag cleanup, and category/account merging
+- Create integrity-checked ZIP backups and restore from ZIP backups
+- Run data quality tools for duplicate checks, tag cleanup, category/account merging, and activity review
 - Back up and restore the local SQLite database
 - Persist data with SQLite
 
@@ -65,13 +71,13 @@ If an older project-local `expense_tracker.db` exists, the app copies it into th
 ## App Tabs
 
 - `Dashboard`: See this-month totals, budget alerts, net worth, account balances, recent records, and upcoming recurring rules.
-- `Records`: Add, edit, delete, filter, import, export, attach receipts, tag, and undo transactions with account tracking.
-- `Reports`: Review spending by category/account, budget progress, and income vs. expense over time, with chart hover and drill-down.
-- `Budgets`: Set monthly category budgets and track remaining budget.
+- `Records`: Add, edit, split, delete, filter, import, export, attach receipts, tag, and undo transactions with account tracking.
+- `Reports`: Review spending by category/account, budget progress, and income vs. expense over time, with chart hover, drill-down, PDF export, and Excel export.
+- `Budgets`: Set monthly category budgets, rollover behavior, annual targets, and track remaining budget.
 - `Categories`: Add, rename, color-code, and remove unused categories.
 - `Accounts`: Set opening balances, account types, icons, sort order, archived state, and transfers.
 - `Recurring`: Manage daily, weekly, monthly, or yearly recurring income and bills.
-- `Tools`: Change language, currency, theme, password, data encryption, update checks, backups, restores, backup folder, data quality tools, or open the local data folder.
+- `Tools`: Change language, currency, theme, password, data encryption, update checks, backups, restores, backup folder, auto-classification rules, activity history, data quality tools, or open the local data folder.
 
 ## Data Encryption
 
