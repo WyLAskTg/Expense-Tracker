@@ -4,28 +4,45 @@ import sys
 import tkinter as tk
 from datetime import date
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from app_config import (
+    APP_ICON,
+    APP_VERSION,
+    CURRENT_BACKUP_KEEP,
+    CURRENCY_OPTIONS,
+    DEFAULT_ACCOUNT,
+    DEFAULT_LANGUAGE,
+    THEME_OPTIONS,
+)
 from database import (
     backup_database,
     database_init,
     delete_budget,
     delete_category,
     delete_record,
+    delete_recurring_rule,
+    generate_due_recurring_records,
+    get_accounts,
     get_categories,
     get_db_path,
     get_months,
     get_setting,
     insert_record,
+    load_account_spending,
     load_budgets,
+    load_budget_progress,
     load_categories,
     load_category_spending,
     load_monthly_summary,
+    load_recurring_rules,
     load_records,
     restore_database,
+    run_auto_backup,
     save_category,
     set_setting,
     update_record,
+    upsert_recurring_rule,
     upsert_budget,
 )
 from i18n import LANGUAGES, translate
@@ -33,24 +50,41 @@ from record_utils import (
     TYPE_OPTIONS,
     amount_entry_text,
     amount_to_cents,
+    csv_headers,
+    default_csv_mapping,
     money_text,
     parse_csv_records,
     parse_month,
     parse_record_date,
     split_new_and_duplicate_records,
 )
+from security import hash_password, verify_password
 
 
 CURRENT_MONTH = date.today().strftime("%Y-%m")
-DEFAULT_LANGUAGE = "en"
-APP_VERSION = "v26.5.2"
-APP_ICON = "assets/app.ico"
-CURRENCY_OPTIONS = {
-    "USD": "$",
-    "CNY": "\u00a5",
-    "EUR": "\u20ac",
-    "GBP": "\u00a3",
-    "JPY": "\u00a5",
+
+LIGHT_PALETTE = {
+    "background": "#f6f8fa",
+    "surface": "#ffffff",
+    "text": "#24292f",
+    "muted": "#57606a",
+    "border": "#d0d7de",
+    "income": "#18794e",
+    "expense": "#b42318",
+    "warning": "#9a6700",
+    "accent": "#0969da",
+}
+
+DARK_PALETTE = {
+    "background": "#1f2328",
+    "surface": "#2d333b",
+    "text": "#f0f3f6",
+    "muted": "#adbac7",
+    "border": "#444c56",
+    "income": "#57ab5a",
+    "expense": "#e5534b",
+    "warning": "#c69026",
+    "accent": "#539bf5",
 }
 
 def resource_path(relative_path):
@@ -64,10 +98,16 @@ class ExpenseTrackerApp:
         self.records = []
         self.budgets = []
         self.categories = []
+        self.accounts = []
+        self.recurring_rules = []
         self.category_chart_data = []
         self.monthly_chart_data = []
+        self.account_chart_data = []
+        self.budget_progress_data = []
         self.editing_record_id = None
         self.editing_category_id = None
+        self.editing_recurring_id = None
+        self.startup_messages = []
 
         database_init()
         self.language_code = get_setting("language", DEFAULT_LANGUAGE)
@@ -77,15 +117,24 @@ class ExpenseTrackerApp:
         if self.currency_code not in CURRENCY_OPTIONS:
             self.currency_code = "USD"
         self.currency_symbol = CURRENCY_OPTIONS[self.currency_code]
+        self.theme_name = get_setting("theme", "Light")
+        if self.theme_name not in THEME_OPTIONS:
+            self.theme_name = "Light"
+        self.palette = LIGHT_PALETTE if self.theme_name == "Light" else DARK_PALETTE
 
         self.root.title(self.t("app_title"))
         self.root.geometry("1120x760")
         self.root.minsize(980, 680)
         self.set_window_icon()
 
+        if not self.unlock_app():
+            self.root.destroy()
+            return
+
+        self.run_startup_jobs()
         self.build_ui()
         self.bind_shortcuts()
-        self.refresh_all(self.t("ready"))
+        self.refresh_all("; ".join(self.startup_messages) if self.startup_messages else self.t("ready"))
 
     def t(self, key, **kwargs):
         return translate(self.language_code, key, **kwargs)
@@ -101,10 +150,48 @@ class ExpenseTrackerApp:
             except tk.TclError:
                 pass
 
+    def has_password(self):
+        return bool(get_setting("password_hash") and get_setting("password_salt"))
+
+    def unlock_app(self):
+        digest = get_setting("password_hash")
+        salt = get_setting("password_salt")
+        if not digest or not salt:
+            return True
+
+        self.root.withdraw()
+        for _ in range(3):
+            password = simpledialog.askstring(
+                self.t("unlock_required"),
+                self.t("password_prompt"),
+                show="*",
+                parent=self.root,
+            )
+            if password is None:
+                return False
+            if verify_password(password, salt, digest):
+                self.root.deiconify()
+                return True
+            messagebox.showerror(self.t("unlock_required"), self.t("invalid_password"), parent=self.root)
+        return False
+
+    def run_startup_jobs(self):
+        try:
+            backup_path = run_auto_backup(CURRENT_BACKUP_KEEP)
+            if backup_path:
+                self.startup_messages.append(self.t("backup_created"))
+        except OSError as exc:
+            self.startup_messages.append(f"{self.t('backup_failed')}: {exc}")
+
+        generated = generate_due_recurring_records()
+        if generated:
+            self.startup_messages.append(self.t("recurring_generated", count=generated))
+
     def build_ui(self):
         self.style = ttk.Style()
         if "clam" in self.style.theme_names():
             self.style.theme_use("clam")
+        self.apply_theme()
 
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
@@ -118,20 +205,43 @@ class ExpenseTrackerApp:
         self.reports_tab = ttk.Frame(self.notebook)
         self.budgets_tab = ttk.Frame(self.notebook)
         self.categories_tab = ttk.Frame(self.notebook)
+        self.recurring_tab = ttk.Frame(self.notebook)
         self.tools_tab = ttk.Frame(self.notebook)
 
         self.notebook.add(self.records_tab, text=self.t("records"))
         self.notebook.add(self.reports_tab, text=self.t("reports"))
         self.notebook.add(self.budgets_tab, text=self.t("budgets"))
         self.notebook.add(self.categories_tab, text=self.t("categories"))
+        self.notebook.add(self.recurring_tab, text=self.t("recurring"))
         self.notebook.add(self.tools_tab, text=self.t("tools"))
 
         self.build_records_tab()
         self.build_reports_tab()
         self.build_budgets_tab()
         self.build_categories_tab()
+        self.build_recurring_tab()
         self.build_tools_tab()
         self.build_status_bar()
+
+    def apply_theme(self):
+        self.palette = LIGHT_PALETTE if self.theme_name == "Light" else DARK_PALETTE
+        self.root.configure(background=self.palette["background"])
+        self.style.configure(".", background=self.palette["background"], foreground=self.palette["text"])
+        self.style.configure("TFrame", background=self.palette["background"])
+        self.style.configure("TLabel", background=self.palette["background"], foreground=self.palette["text"])
+        self.style.configure("TLabelframe", background=self.palette["background"], foreground=self.palette["text"])
+        self.style.configure("TLabelframe.Label", background=self.palette["background"], foreground=self.palette["text"])
+        self.style.configure("TNotebook", background=self.palette["background"], bordercolor=self.palette["border"])
+        self.style.configure("TNotebook.Tab", padding=(12, 6))
+        self.style.configure(
+            "Treeview",
+            background=self.palette["surface"],
+            fieldbackground=self.palette["surface"],
+            foreground=self.palette["text"],
+            bordercolor=self.palette["border"],
+        )
+        self.style.configure("Treeview.Heading", background=self.palette["background"], foreground=self.palette["text"])
+        self.style.map("Treeview", background=[("selected", self.palette["accent"])])
 
     def build_header(self):
         header = ttk.Frame(self.root, padding=(16, 12, 16, 8))
@@ -183,6 +293,19 @@ class ExpenseTrackerApp:
         set_setting("currency", new_currency)
         self.refresh_all(self.t("ready"))
 
+    def change_theme(self, event=None):
+        new_theme = self.theme_var.get()
+        if new_theme not in THEME_OPTIONS or new_theme == self.theme_name:
+            return
+
+        self.theme_name = new_theme
+        set_setting("theme", new_theme)
+        for child in self.root.winfo_children():
+            child.destroy()
+        self.build_ui()
+        self.bind_shortcuts()
+        self.refresh_all(self.t("ready"))
+
     def build_records_tab(self):
         self.records_tab.columnconfigure(0, weight=1)
         self.records_tab.rowconfigure(3, weight=1)
@@ -194,12 +317,13 @@ class ExpenseTrackerApp:
     def build_record_editor(self):
         editor = ttk.LabelFrame(self.records_tab, text=self.t("record"), padding=12)
         editor.grid(row=0, column=0, padx=10, pady=(10, 8), sticky="ew")
-        for column in range(8):
+        for column in range(9):
             editor.columnconfigure(column, weight=1)
 
         self.date_var = tk.StringVar(value=date.today().isoformat())
         self.type_var = tk.StringVar(value="expense")
         self.category_var = tk.StringVar()
+        self.account_var = tk.StringVar(value=DEFAULT_ACCOUNT)
         self.amount_var = tk.StringVar()
         self.note_var = tk.StringVar()
 
@@ -221,27 +345,32 @@ class ExpenseTrackerApp:
         self.category_combo = ttk.Combobox(editor, textvariable=self.category_var, width=18)
         self.category_combo.grid(row=1, column=2, sticky="ew", padx=(0, 10), pady=(3, 0))
 
-        ttk.Label(editor, text=self.t("amount")).grid(row=0, column=3, sticky="w", padx=(0, 6))
-        self.amount_entry = ttk.Entry(editor, textvariable=self.amount_var, width=12)
-        self.amount_entry.grid(row=1, column=3, sticky="ew", padx=(0, 10), pady=(3, 0))
+        ttk.Label(editor, text=self.t("account")).grid(row=0, column=3, sticky="w", padx=(0, 6))
+        self.account_combo = ttk.Combobox(editor, textvariable=self.account_var, width=14)
+        self.account_combo.grid(row=1, column=3, sticky="ew", padx=(0, 10), pady=(3, 0))
 
-        ttk.Label(editor, text=self.t("note")).grid(row=0, column=4, sticky="w", padx=(0, 6))
+        ttk.Label(editor, text=self.t("amount")).grid(row=0, column=4, sticky="w", padx=(0, 6))
+        self.amount_entry = ttk.Entry(editor, textvariable=self.amount_var, width=12)
+        self.amount_entry.grid(row=1, column=4, sticky="ew", padx=(0, 10), pady=(3, 0))
+
+        ttk.Label(editor, text=self.t("note")).grid(row=0, column=5, sticky="w", padx=(0, 6))
         self.note_entry = ttk.Entry(editor, textvariable=self.note_var)
-        self.note_entry.grid(row=1, column=4, columnspan=2, sticky="ew", padx=(0, 10), pady=(3, 0))
+        self.note_entry.grid(row=1, column=5, columnspan=2, sticky="ew", padx=(0, 10), pady=(3, 0))
 
         self.save_button = ttk.Button(editor, text=self.t("add_record"), command=self.save_record)
-        self.save_button.grid(row=1, column=6, sticky="ew", padx=(0, 8), pady=(3, 0))
+        self.save_button.grid(row=1, column=7, sticky="ew", padx=(0, 8), pady=(3, 0))
 
         clear_button = ttk.Button(editor, text=self.t("clear"), command=self.clear_form)
-        clear_button.grid(row=1, column=7, sticky="ew", pady=(3, 0))
+        clear_button.grid(row=1, column=8, sticky="ew", pady=(3, 0))
 
     def build_record_filters(self):
         filters = ttk.Frame(self.records_tab, padding=(10, 0, 10, 8))
         filters.grid(row=1, column=0, sticky="ew")
-        filters.columnconfigure(6, weight=1)
+        filters.columnconfigure(8, weight=1)
 
         self.month_filter_var = tk.StringVar()
         self.category_filter_var = tk.StringVar()
+        self.account_filter_var = tk.StringVar()
         self.search_var = tk.StringVar()
 
         ttk.Label(filters, text=self.t("month")).grid(row=0, column=0, sticky="w")
@@ -256,16 +385,24 @@ class ExpenseTrackerApp:
         )
         self.category_filter.grid(row=0, column=3, sticky="w", padx=(6, 14))
 
-        ttk.Label(filters, text=self.t("search")).grid(row=0, column=4, sticky="w")
+        ttk.Label(filters, text=self.t("account")).grid(row=0, column=4, sticky="w")
+        self.account_filter = ttk.Combobox(
+            filters,
+            textvariable=self.account_filter_var,
+            width=14,
+        )
+        self.account_filter.grid(row=0, column=5, sticky="w", padx=(6, 14))
+
+        ttk.Label(filters, text=self.t("search")).grid(row=0, column=6, sticky="w")
         ttk.Entry(filters, textvariable=self.search_var, width=22).grid(
-            row=0, column=5, sticky="w", padx=(6, 14)
+            row=0, column=7, sticky="w", padx=(6, 14)
         )
 
         ttk.Button(filters, text=self.t("apply"), command=lambda: self.refresh_records()).grid(
-            row=0, column=7, sticky="e", padx=(0, 8)
+            row=0, column=9, sticky="e", padx=(0, 8)
         )
         ttk.Button(filters, text=self.t("reset"), command=self.reset_filters).grid(
-            row=0, column=8, sticky="e"
+            row=0, column=10, sticky="e"
         )
 
         summary = ttk.Frame(self.records_tab, padding=(10, 0, 10, 8))
@@ -289,19 +426,21 @@ class ExpenseTrackerApp:
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
 
-        columns = ("date", "type", "category", "amount", "note")
+        columns = ("date", "type", "category", "account", "amount", "note")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
         self.tree.heading("date", text=self.t("date"))
         self.tree.heading("type", text=self.t("type"))
         self.tree.heading("category", text=self.t("category"))
+        self.tree.heading("account", text=self.t("account"))
         self.tree.heading("amount", text=self.t("amount"))
         self.tree.heading("note", text=self.t("note"))
 
         self.tree.column("date", width=110, minwidth=90, anchor="w")
         self.tree.column("type", width=90, minwidth=80, anchor="w")
         self.tree.column("category", width=160, minwidth=120, anchor="w")
+        self.tree.column("account", width=130, minwidth=100, anchor="w")
         self.tree.column("amount", width=120, minwidth=100, anchor="e")
-        self.tree.column("note", width=420, minwidth=180, anchor="w")
+        self.tree.column("note", width=340, minwidth=180, anchor="w")
 
         self.tree.tag_configure("income", foreground="#18794e")
         self.tree.tag_configure("expense", foreground="#b42318")
@@ -331,6 +470,7 @@ class ExpenseTrackerApp:
         self.reports_tab.columnconfigure(0, weight=1)
         self.reports_tab.columnconfigure(1, weight=1)
         self.reports_tab.rowconfigure(2, weight=1)
+        self.reports_tab.rowconfigure(3, weight=1)
 
         controls = ttk.Frame(self.reports_tab, padding=(10, 10, 10, 8))
         controls.grid(row=0, column=0, columnspan=2, sticky="ew")
@@ -359,12 +499,26 @@ class ExpenseTrackerApp:
         ttk.Label(metrics, textvariable=self.report_balance_var).grid(row=0, column=2, sticky="w")
         ttk.Label(metrics, textvariable=self.report_top_category_var).grid(row=0, column=3, sticky="e")
 
-        self.category_canvas = tk.Canvas(self.reports_tab, background="#ffffff", highlightthickness=1, highlightbackground="#d0d7de")
-        self.trend_canvas = tk.Canvas(self.reports_tab, background="#ffffff", highlightthickness=1, highlightbackground="#d0d7de")
+        self.category_canvas = self.create_report_canvas()
+        self.trend_canvas = self.create_report_canvas()
+        self.account_canvas = self.create_report_canvas()
+        self.budget_canvas = self.create_report_canvas()
         self.category_canvas.grid(row=2, column=0, sticky="nsew", padx=(10, 5), pady=(0, 10))
         self.trend_canvas.grid(row=2, column=1, sticky="nsew", padx=(5, 10), pady=(0, 10))
+        self.account_canvas.grid(row=3, column=0, sticky="nsew", padx=(10, 5), pady=(0, 10))
+        self.budget_canvas.grid(row=3, column=1, sticky="nsew", padx=(5, 10), pady=(0, 10))
         self.category_canvas.bind("<Configure>", lambda event: self.draw_category_chart())
         self.trend_canvas.bind("<Configure>", lambda event: self.draw_trend_chart())
+        self.account_canvas.bind("<Configure>", lambda event: self.draw_account_chart())
+        self.budget_canvas.bind("<Configure>", lambda event: self.draw_budget_progress_chart())
+
+    def create_report_canvas(self):
+        return tk.Canvas(
+            self.reports_tab,
+            background=self.palette["surface"],
+            highlightthickness=1,
+            highlightbackground=self.palette["border"],
+        )
 
     def build_budgets_tab(self):
         self.budgets_tab.columnconfigure(0, weight=1)
@@ -517,6 +671,121 @@ class ExpenseTrackerApp:
         self.category_tree.bind("<<TreeviewSelect>>", self.on_category_select)
         self.category_tree.bind("<Delete>", lambda event: self.delete_selected_category())
 
+    def build_recurring_tab(self):
+        self.recurring_tab.columnconfigure(0, weight=1)
+        self.recurring_tab.rowconfigure(1, weight=1)
+
+        editor = ttk.LabelFrame(self.recurring_tab, text=self.t("recurring_rules"), padding=12)
+        editor.grid(row=0, column=0, padx=10, pady=(10, 8), sticky="ew")
+        for column in range(10):
+            editor.columnconfigure(column, weight=1)
+
+        self.recurring_name_var = tk.StringVar()
+        self.recurring_day_var = tk.StringVar(value=str(date.today().day))
+        self.recurring_type_var = tk.StringVar(value="expense")
+        self.recurring_category_var = tk.StringVar()
+        self.recurring_account_var = tk.StringVar(value=DEFAULT_ACCOUNT)
+        self.recurring_amount_var = tk.StringVar()
+        self.recurring_note_var = tk.StringVar()
+        self.recurring_active_var = tk.BooleanVar(value=True)
+
+        ttk.Label(editor, text=self.t("rule_name")).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(editor, textvariable=self.recurring_name_var, width=18).grid(
+            row=1, column=0, sticky="ew", padx=(0, 10), pady=(3, 0)
+        )
+
+        ttk.Label(editor, text=self.t("day_of_month")).grid(row=0, column=1, sticky="w", padx=(0, 6))
+        ttk.Spinbox(editor, from_=1, to=31, textvariable=self.recurring_day_var, width=6).grid(
+            row=1, column=1, sticky="ew", padx=(0, 10), pady=(3, 0)
+        )
+
+        ttk.Label(editor, text=self.t("type")).grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Combobox(
+            editor,
+            textvariable=self.recurring_type_var,
+            values=TYPE_OPTIONS,
+            state="readonly",
+            width=10,
+        ).grid(row=1, column=2, sticky="ew", padx=(0, 10), pady=(3, 0))
+
+        ttk.Label(editor, text=self.t("category")).grid(row=0, column=3, sticky="w", padx=(0, 6))
+        self.recurring_category_combo = ttk.Combobox(editor, textvariable=self.recurring_category_var, width=16)
+        self.recurring_category_combo.grid(row=1, column=3, sticky="ew", padx=(0, 10), pady=(3, 0))
+
+        ttk.Label(editor, text=self.t("account")).grid(row=0, column=4, sticky="w", padx=(0, 6))
+        self.recurring_account_combo = ttk.Combobox(editor, textvariable=self.recurring_account_var, width=14)
+        self.recurring_account_combo.grid(row=1, column=4, sticky="ew", padx=(0, 10), pady=(3, 0))
+
+        ttk.Label(editor, text=self.t("amount")).grid(row=0, column=5, sticky="w", padx=(0, 6))
+        ttk.Entry(editor, textvariable=self.recurring_amount_var, width=12).grid(
+            row=1, column=5, sticky="ew", padx=(0, 10), pady=(3, 0)
+        )
+
+        ttk.Label(editor, text=self.t("note")).grid(row=0, column=6, sticky="w", padx=(0, 6))
+        ttk.Entry(editor, textvariable=self.recurring_note_var).grid(
+            row=1, column=6, sticky="ew", padx=(0, 10), pady=(3, 0)
+        )
+
+        ttk.Checkbutton(editor, text=self.t("active"), variable=self.recurring_active_var).grid(
+            row=1, column=7, sticky="w", padx=(0, 10), pady=(3, 0)
+        )
+
+        self.recurring_save_button = ttk.Button(editor, text=self.t("save_rule"), command=self.save_recurring_rule)
+        self.recurring_save_button.grid(row=1, column=8, sticky="ew", padx=(0, 8), pady=(3, 0))
+        ttk.Button(editor, text=self.t("clear"), command=self.clear_recurring_form).grid(
+            row=1, column=9, sticky="ew", pady=(3, 0)
+        )
+
+        table_frame = ttk.Frame(self.recurring_tab, padding=(10, 0, 10, 10))
+        table_frame.grid(row=1, column=0, sticky="nsew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        columns = ("name", "day", "type", "category", "account", "amount", "status", "last", "note")
+        self.recurring_tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        for column, label_key in (
+            ("name", "rule_name"),
+            ("day", "day_of_month"),
+            ("type", "type"),
+            ("category", "category"),
+            ("account", "account"),
+            ("amount", "amount"),
+            ("status", "status"),
+            ("last", "last_generated"),
+            ("note", "note"),
+        ):
+            self.recurring_tree.heading(column, text=self.t(label_key))
+
+        self.recurring_tree.column("name", width=160, minwidth=120, anchor="w")
+        self.recurring_tree.column("day", width=90, minwidth=70, anchor="e")
+        self.recurring_tree.column("type", width=90, minwidth=80, anchor="w")
+        self.recurring_tree.column("category", width=140, minwidth=110, anchor="w")
+        self.recurring_tree.column("account", width=120, minwidth=100, anchor="w")
+        self.recurring_tree.column("amount", width=110, minwidth=90, anchor="e")
+        self.recurring_tree.column("status", width=90, minwidth=80, anchor="w")
+        self.recurring_tree.column("last", width=110, minwidth=90, anchor="w")
+        self.recurring_tree.column("note", width=260, minwidth=160, anchor="w")
+
+        recurring_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.recurring_tree.yview)
+        self.recurring_tree.configure(yscrollcommand=recurring_scroll.set)
+        self.recurring_tree.grid(row=0, column=0, sticky="nsew")
+        recurring_scroll.grid(row=0, column=1, sticky="ns")
+
+        actions = ttk.Frame(table_frame)
+        actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        actions.columnconfigure(3, weight=1)
+        ttk.Button(actions, text=self.t("edit"), command=self.start_recurring_edit).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text=self.t("delete"), command=self.delete_selected_recurring_rule).grid(
+            row=0, column=1, padx=(0, 8)
+        )
+        ttk.Button(actions, text=self.t("generate_due_now"), command=self.generate_recurring_now).grid(
+            row=0, column=2
+        )
+
+        self.recurring_tree.bind("<<TreeviewSelect>>", self.on_recurring_select)
+        self.recurring_tree.bind("<Double-1>", lambda event: self.start_recurring_edit())
+        self.recurring_tree.bind("<Delete>", lambda event: self.delete_selected_recurring_rule())
+
     def build_tools_tab(self):
         self.tools_tab.columnconfigure(0, weight=1)
 
@@ -527,6 +796,7 @@ class ExpenseTrackerApp:
 
         self.settings_language_var = tk.StringVar(value=self.language_code)
         self.currency_var = tk.StringVar(value=self.currency_code)
+        self.theme_var = tk.StringVar(value=self.theme_name)
 
         ttk.Label(settings_frame, text=self.t("language")).grid(row=0, column=0, sticky="w", padx=(0, 8))
         settings_language_combo = ttk.Combobox(
@@ -549,6 +819,31 @@ class ExpenseTrackerApp:
         )
         currency_combo.grid(row=0, column=3, sticky="w")
         currency_combo.bind("<<ComboboxSelected>>", self.change_currency)
+
+        ttk.Label(settings_frame, text=self.t("theme")).grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(12, 0))
+        theme_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self.theme_var,
+            values=THEME_OPTIONS,
+            state="readonly",
+            width=10,
+        )
+        theme_combo.grid(row=1, column=1, sticky="w", padx=(0, 20), pady=(12, 0))
+        theme_combo.bind("<<ComboboxSelected>>", self.change_theme)
+
+        ttk.Label(settings_frame, text=self.t("password")).grid(row=1, column=2, sticky="w", padx=(0, 8), pady=(12, 0))
+        self.password_status_var = tk.StringVar(
+            value=self.t("password_enabled") if self.has_password() else self.t("password_not_enabled")
+        )
+        ttk.Label(settings_frame, textvariable=self.password_status_var).grid(
+            row=1, column=3, sticky="w", pady=(12, 0)
+        )
+        ttk.Button(settings_frame, text=self.t("change_password"), command=self.change_password).grid(
+            row=1, column=4, sticky="w", padx=(8, 0), pady=(12, 0)
+        )
+        ttk.Button(settings_frame, text=self.t("remove_password"), command=self.remove_password).grid(
+            row=1, column=5, sticky="w", padx=(8, 0), pady=(12, 0)
+        )
 
         data_frame = ttk.LabelFrame(self.tools_tab, text=self.t("data"), padding=12)
         data_frame.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="ew")
@@ -588,17 +883,24 @@ class ExpenseTrackerApp:
         self.refresh_reports(update_status=False)
         self.refresh_budgets(update_status=False)
         self.refresh_categories(update_status=False)
+        self.refresh_recurring(update_status=False)
         self.update_picker_options()
 
     def update_picker_options(self):
         categories = get_categories()
+        accounts = get_accounts()
         months = get_months()
         if CURRENT_MONTH not in months:
             months = [CURRENT_MONTH] + months
 
+        self.accounts = accounts
         self.category_combo.configure(values=categories)
         self.category_filter.configure(values=[""] + categories)
+        self.account_combo.configure(values=accounts)
+        self.account_filter.configure(values=[""] + accounts)
         self.budget_category_combo.configure(values=categories)
+        self.recurring_category_combo.configure(values=categories)
+        self.recurring_account_combo.configure(values=accounts)
         self.month_filter.configure(values=[""] + months)
         self.report_month_combo.configure(values=[""] + months)
         self.budget_month_combo.configure(values=months)
@@ -611,6 +913,8 @@ class ExpenseTrackerApp:
             self.save_budget()
         elif current == str(self.categories_tab):
             self.save_category()
+        elif current == str(self.recurring_tab):
+            self.save_recurring_rule()
         else:
             self.set_status(self.t("nothing_to_save"))
 
@@ -622,23 +926,26 @@ class ExpenseTrackerApp:
             self.clear_budget_form()
         elif current == str(self.categories_tab):
             self.clear_category_form()
+        elif current == str(self.recurring_tab):
+            self.clear_recurring_form()
         else:
             self.set_status(self.t("nothing_to_clear"))
 
     def filters(self):
         month = parse_month(self.month_filter_var.get())
         category = self.category_filter_var.get().strip() or None
+        account = self.account_filter_var.get().strip() or None
         search = self.search_var.get().strip() or None
-        return month, category, search
+        return month, category, account, search
 
     def refresh_records(self, status_message=None):
         try:
-            month, category, search = self.filters()
+            month, category, account, search = self.filters()
         except ValueError as exc:
             self.set_status(str(exc))
             return
 
-        self.records = load_records(month=month, category=category, search=search)
+        self.records = load_records(month=month, category=category, account=account, search=search)
         self.populate_table()
         self.update_summary()
         self.update_picker_options()
@@ -663,6 +970,7 @@ class ExpenseTrackerApp:
                     record["date"],
                     self.type_text(record["type"]),
                     record["category"],
+                    record.get("account") or DEFAULT_ACCOUNT,
                     amount,
                     record["note"] or "",
                 ),
@@ -698,6 +1006,7 @@ class ExpenseTrackerApp:
         record_date = parse_record_date(self.date_var.get())
         record_type = self.type_var.get()
         category = self.category_var.get().strip()
+        account = self.account_var.get().strip() or DEFAULT_ACCOUNT
         amount_cents = amount_to_cents(self.amount_var.get())
         note = self.note_var.get().strip()
 
@@ -705,18 +1014,20 @@ class ExpenseTrackerApp:
             raise ValueError("Type must be income or expense.")
         if not category:
             raise ValueError("Category must be non-empty.")
+        if not account:
+            raise ValueError("Account must be non-empty.")
 
-        return record_type, category, amount_cents, note, record_date
+        return record_type, category, account, amount_cents, note, record_date
 
     def save_record(self):
         try:
-            record_type, category, amount_cents, note, record_date = self.read_form()
+            record_type, category, account, amount_cents, note, record_date = self.read_form()
         except ValueError as exc:
             self.set_status(str(exc))
             return
 
         if self.editing_record_id is None:
-            insert_record(record_type, category, amount_cents, note, record_date)
+            insert_record(record_type, category, amount_cents, note, record_date, account=account)
             self.clear_form(reset_status=False)
             self.refresh_all(self.t("record_added"))
             return
@@ -728,6 +1039,7 @@ class ExpenseTrackerApp:
             amount_cents,
             note,
             record_date,
+            account=account,
         )
         self.clear_form(reset_status=False)
         self.refresh_all(self.t("record_updated") if updated else "Record was not found.")
@@ -742,6 +1054,7 @@ class ExpenseTrackerApp:
         self.date_var.set(record["date"])
         self.type_var.set(record["type"])
         self.category_var.set(record["category"])
+        self.account_var.set(record.get("account") or DEFAULT_ACCOUNT)
         self.amount_var.set(amount_entry_text(record["amount_cents"]))
         self.note_var.set(record["note"] or "")
         self.save_button.configure(text=self.t("update_record"))
@@ -754,6 +1067,7 @@ class ExpenseTrackerApp:
         self.date_var.set(date.today().isoformat())
         self.type_var.set("expense")
         self.category_var.set("")
+        self.account_var.set(DEFAULT_ACCOUNT)
         self.amount_var.set("")
         self.note_var.set("")
         self.save_button.configure(text=self.t("add_record"))
@@ -783,6 +1097,7 @@ class ExpenseTrackerApp:
     def reset_filters(self):
         self.month_filter_var.set("")
         self.category_filter_var.set("")
+        self.account_filter_var.set("")
         self.search_var.set("")
         self.refresh_records(self.t("filters_reset"))
 
@@ -804,13 +1119,14 @@ class ExpenseTrackerApp:
 
         with open(path, "w", newline="", encoding="utf-8-sig") as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow(["date", "type", "category", "amount", "note"])
+            writer.writerow(["date", "type", "category", "account", "amount", "note"])
             for record in self.records:
                 writer.writerow(
                     [
                         record["date"],
                         record["type"],
                         record["category"],
+                        record.get("account") or DEFAULT_ACCOUNT,
                         amount_entry_text(record["amount_cents"]),
                         record["note"] or "",
                     ]
@@ -828,7 +1144,12 @@ class ExpenseTrackerApp:
             return
 
         try:
-            parsed_records = parse_csv_records(path)
+            headers = csv_headers(path)
+            mapping = self.show_csv_mapping_dialog(headers)
+            if mapping is None:
+                self.set_status(self.t("import_cancelled"))
+                return
+            parsed_records = parse_csv_records(path, mapping=mapping)
             records, duplicates = split_new_and_duplicate_records(parsed_records, load_records())
         except (OSError, ValueError) as exc:
             messagebox.showerror(self.t("import_failed"), str(exc))
@@ -855,12 +1176,66 @@ class ExpenseTrackerApp:
                 record["amount_cents"],
                 record["note"],
                 record["date"],
+                account=record.get("account") or DEFAULT_ACCOUNT,
             )
 
         self.refresh_all(f"Imported {len(records)} record(s).")
 
     def read_csv_records(self, path):
         return parse_csv_records(path)
+
+    def show_csv_mapping_dialog(self, headers):
+        dialog = tk.Toplevel(self.root)
+        dialog.title(self.t("csv_mapping"))
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        mapping = default_csv_mapping(headers)
+        selected = {key: tk.StringVar(value=value or "") for key, value in mapping.items()}
+        result = {"mapping": None}
+        choices = [""] + headers
+
+        ttk.Label(dialog, text=self.t("csv_mapping_help"), padding=(12, 10)).grid(
+            row=0, column=0, columnspan=2, sticky="ew"
+        )
+
+        fields = ("date", "type", "category", "account", "amount", "note")
+        for row, field in enumerate(fields, start=1):
+            label = self.t(field)
+            if field in {"date", "type", "category", "amount"}:
+                label = f"{label} *"
+            ttk.Label(dialog, text=label).grid(row=row, column=0, sticky="w", padx=(12, 8), pady=4)
+            ttk.Combobox(
+                dialog,
+                textvariable=selected[field],
+                values=choices,
+                state="readonly",
+                width=28,
+            ).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=4)
+
+        actions = ttk.Frame(dialog, padding=(12, 8, 12, 12))
+        actions.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="ew")
+        actions.columnconfigure(0, weight=1)
+
+        def accept():
+            candidate = {field: selected[field].get() or None for field in fields}
+            missing = [field for field in ("date", "type", "category", "amount") if not candidate[field]]
+            if missing:
+                messagebox.showerror(
+                    self.t("csv_mapping"),
+                    self.t("csv_missing_required", fields=", ".join(missing)),
+                    parent=dialog,
+                )
+                return
+            result["mapping"] = candidate
+            dialog.destroy()
+
+        ttk.Button(actions, text=self.t("confirm"), command=accept).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(actions, text=self.t("cancel"), command=dialog.destroy).grid(row=0, column=2)
+
+        self.root.wait_window(dialog)
+        return result["mapping"]
 
     def show_import_preview(self, records, duplicates):
         dialog = tk.Toplevel(self.root)
@@ -909,12 +1284,13 @@ class ExpenseTrackerApp:
     def build_preview_table(self, parent, records):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
-        columns = ("date", "type", "category", "amount", "note")
+        columns = ("date", "type", "category", "account", "amount", "note")
         tree = ttk.Treeview(parent, columns=columns, show="headings")
         for column, label_key in (
             ("date", "date"),
             ("type", "type"),
             ("category", "category"),
+            ("account", "account"),
             ("amount", "amount"),
             ("note", "note"),
         ):
@@ -923,8 +1299,9 @@ class ExpenseTrackerApp:
         tree.column("date", width=100, anchor="w")
         tree.column("type", width=90, anchor="w")
         tree.column("category", width=140, anchor="w")
+        tree.column("account", width=110, anchor="w")
         tree.column("amount", width=110, anchor="e")
-        tree.column("note", width=280, anchor="w")
+        tree.column("note", width=220, anchor="w")
 
         scroll = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scroll.set)
@@ -939,6 +1316,7 @@ class ExpenseTrackerApp:
                     record["date"],
                     self.type_text(record["type"]),
                     record["category"],
+                    record.get("account") or DEFAULT_ACCOUNT,
                     self.money_text(record["amount_cents"]),
                     record["note"],
                 ),
@@ -958,6 +1336,8 @@ class ExpenseTrackerApp:
 
         self.category_chart_data = load_category_spending(month=month)
         self.monthly_chart_data = load_monthly_summary(limit=12)
+        self.account_chart_data = load_account_spending(month=month)
+        self.budget_progress_data = load_budget_progress(month or CURRENT_MONTH)
 
         self.report_income_var.set(f"{self.t('income')}: {self.money_text(income)}")
         self.report_expense_var.set(f"{self.t('expense')}: {self.money_text(expense)}")
@@ -973,6 +1353,8 @@ class ExpenseTrackerApp:
 
         self.draw_category_chart()
         self.draw_trend_chart()
+        self.draw_account_chart()
+        self.draw_budget_progress_chart()
         self.update_picker_options()
         if update_status:
             self.set_status(self.t("reports_refreshed"))
@@ -980,6 +1362,7 @@ class ExpenseTrackerApp:
     def draw_category_chart(self):
         canvas = self.category_canvas
         canvas.delete("all")
+        canvas.configure(background=self.palette["surface"], highlightbackground=self.palette["border"])
         width = max(canvas.winfo_width(), 360)
         height = max(canvas.winfo_height(), 260)
         left = 120
@@ -987,11 +1370,18 @@ class ExpenseTrackerApp:
         top = 44
         row_height = 30
 
-        canvas.create_text(16, 16, anchor="w", text=self.t("category_spending"), font=("Segoe UI", 11, "bold"), fill="#24292f")
+        canvas.create_text(
+            16,
+            16,
+            anchor="w",
+            text=self.t("category_spending"),
+            font=("Segoe UI", 11, "bold"),
+            fill=self.palette["text"],
+        )
 
         rows = self.category_chart_data[:8]
         if not rows:
-            canvas.create_text(width / 2, height / 2, text=self.t("no_expense_data"), fill="#57606a")
+            canvas.create_text(width / 2, height / 2, text=self.t("no_expense_data"), fill=self.palette["muted"])
             return
 
         max_value = max(row["spent_cents"] or 0 for row in rows) or 1
@@ -1003,13 +1393,14 @@ class ExpenseTrackerApp:
             value = int(row["spent_cents"] or 0)
             length = max(int(bar_width * value / max_value), 2)
             color = row.get("color") or colors[index % len(colors)]
-            canvas.create_text(16, y + 10, anchor="w", text=row["category"], fill="#24292f")
+            canvas.create_text(16, y + 10, anchor="w", text=row["category"], fill=self.palette["text"])
             canvas.create_rectangle(left, y, left + length, y + 18, fill=color, outline="")
-            canvas.create_text(left + length + 8, y + 9, anchor="w", text=self.money_text(value), fill="#57606a")
+            canvas.create_text(left + length + 8, y + 9, anchor="w", text=self.money_text(value), fill=self.palette["muted"])
 
     def draw_trend_chart(self):
         canvas = self.trend_canvas
         canvas.delete("all")
+        canvas.configure(background=self.palette["surface"], highlightbackground=self.palette["border"])
         width = max(canvas.winfo_width(), 360)
         height = max(canvas.winfo_height(), 260)
         left = 44
@@ -1017,10 +1408,10 @@ class ExpenseTrackerApp:
         top = 44
         bottom = 40
 
-        canvas.create_text(16, 16, anchor="w", text=self.t("trend"), font=("Segoe UI", 11, "bold"), fill="#24292f")
+        canvas.create_text(16, 16, anchor="w", text=self.t("trend"), font=("Segoe UI", 11, "bold"), fill=self.palette["text"])
         rows = self.monthly_chart_data
         if not rows:
-            canvas.create_text(width / 2, height / 2, text=self.t("no_monthly_data"), fill="#57606a")
+            canvas.create_text(width / 2, height / 2, text=self.t("no_monthly_data"), fill=self.palette["muted"])
             return
 
         max_value = max(
@@ -1031,12 +1422,12 @@ class ExpenseTrackerApp:
         chart_height = max(height - top - bottom, 120)
         slot = chart_width / max(len(rows), 1)
 
-        canvas.create_line(left, top + chart_height, width - right, top + chart_height, fill="#d0d7de")
-        canvas.create_text(left, top - 8, anchor="w", text=self.money_text(max_value), fill="#57606a")
-        canvas.create_text(width - right - 140, 18, anchor="w", text=self.t("income"), fill="#18794e")
-        canvas.create_rectangle(width - right - 160, 12, width - right - 146, 24, fill="#18794e", outline="")
-        canvas.create_text(width - right - 68, 18, anchor="w", text=self.t("expense"), fill="#b42318")
-        canvas.create_rectangle(width - right - 88, 12, width - right - 74, 24, fill="#b42318", outline="")
+        canvas.create_line(left, top + chart_height, width - right, top + chart_height, fill=self.palette["border"])
+        canvas.create_text(left, top - 8, anchor="w", text=self.money_text(max_value), fill=self.palette["muted"])
+        canvas.create_text(width - right - 140, 18, anchor="w", text=self.t("income"), fill=self.palette["income"])
+        canvas.create_rectangle(width - right - 160, 12, width - right - 146, 24, fill=self.palette["income"], outline="")
+        canvas.create_text(width - right - 68, 18, anchor="w", text=self.t("expense"), fill=self.palette["expense"])
+        canvas.create_rectangle(width - right - 88, 12, width - right - 74, 24, fill=self.palette["expense"], outline="")
 
         for index, row in enumerate(rows):
             x = left + index * slot + slot * 0.18
@@ -1051,7 +1442,7 @@ class ExpenseTrackerApp:
                 top + chart_height - income_h,
                 x + bar_w,
                 top + chart_height,
-                fill="#18794e",
+                fill=self.palette["income"],
                 outline="",
             )
             canvas.create_rectangle(
@@ -1059,14 +1450,90 @@ class ExpenseTrackerApp:
                 top + chart_height - expense_h,
                 x + bar_w * 2 + 4,
                 top + chart_height,
-                fill="#b42318",
+                fill=self.palette["expense"],
                 outline="",
             )
             canvas.create_text(
                 x + bar_w,
                 top + chart_height + 14,
                 text=row["month"][5:],
-                fill="#57606a",
+                fill=self.palette["muted"],
+            )
+
+    def draw_account_chart(self):
+        canvas = self.account_canvas
+        canvas.delete("all")
+        canvas.configure(background=self.palette["surface"], highlightbackground=self.palette["border"])
+        width = max(canvas.winfo_width(), 360)
+        left = 120
+        right = 24
+        top = 44
+        row_height = 30
+
+        canvas.create_text(
+            16,
+            16,
+            anchor="w",
+            text=self.t("account_spending"),
+            font=("Segoe UI", 11, "bold"),
+            fill=self.palette["text"],
+        )
+        rows = self.account_chart_data[:8]
+        if not rows:
+            canvas.create_text(width / 2, 130, text=self.t("no_account_data"), fill=self.palette["muted"])
+            return
+
+        max_value = max(int(row["spent_cents"] or 0) for row in rows) or 1
+        bar_width = max(width - left - right, 120)
+        for index, row in enumerate(rows):
+            y = top + index * row_height
+            value = int(row["spent_cents"] or 0)
+            length = max(int(bar_width * value / max_value), 2)
+            canvas.create_text(16, y + 10, anchor="w", text=row["account"], fill=self.palette["text"])
+            canvas.create_rectangle(left, y, left + length, y + 18, fill=self.palette["accent"], outline="")
+            canvas.create_text(left + length + 8, y + 9, anchor="w", text=self.money_text(value), fill=self.palette["muted"])
+
+    def draw_budget_progress_chart(self):
+        canvas = self.budget_canvas
+        canvas.delete("all")
+        canvas.configure(background=self.palette["surface"], highlightbackground=self.palette["border"])
+        width = max(canvas.winfo_width(), 360)
+        left = 120
+        right = 72
+        top = 44
+        row_height = 30
+
+        canvas.create_text(
+            16,
+            16,
+            anchor="w",
+            text=self.t("budget_progress"),
+            font=("Segoe UI", 11, "bold"),
+            fill=self.palette["text"],
+        )
+        rows = self.budget_progress_data[:8]
+        if not rows:
+            canvas.create_text(width / 2, 130, text=self.t("no_budget_data"), fill=self.palette["muted"])
+            return
+
+        bar_width = max(width - left - right, 120)
+        for index, row in enumerate(rows):
+            y = top + index * row_height
+            budget = int(row["budget_cents"] or 0)
+            spent = int(row["spent_cents"] or 0)
+            usage = spent / budget if budget else 0
+            length = max(min(int(bar_width * usage), bar_width), 2 if spent else 0)
+            color = self.palette["expense"] if usage > 1 else self.palette["warning"] if usage >= 0.8 else self.palette["income"]
+            canvas.create_text(16, y + 10, anchor="w", text=row["category"], fill=self.palette["text"])
+            canvas.create_rectangle(left, y, left + bar_width, y + 18, fill=self.palette["background"], outline=self.palette["border"])
+            if length:
+                canvas.create_rectangle(left, y, left + length, y + 18, fill=color, outline="")
+            canvas.create_text(
+                left + bar_width + 8,
+                y + 9,
+                anchor="w",
+                text=f"{usage * 100:.0f}%",
+                fill=self.palette["muted"],
             )
 
     def read_budget_form(self):
@@ -1317,6 +1784,217 @@ class ExpenseTrackerApp:
 
         self.clear_category_form(reset_status=False)
         self.refresh_all(self.t("category_deleted"))
+
+    def refresh_recurring(self, update_status=True):
+        self.recurring_rules = load_recurring_rules()
+
+        for item in self.recurring_tree.get_children():
+            self.recurring_tree.delete(item)
+
+        for rule in self.recurring_rules:
+            status = self.t("active") if rule["active"] else self.t("inactive")
+            self.recurring_tree.insert(
+                "",
+                tk.END,
+                iid=str(rule["id"]),
+                values=(
+                    rule["name"],
+                    rule["day_of_month"],
+                    self.type_text(rule["type"]),
+                    rule["category"],
+                    rule["account"],
+                    self.money_text(rule["amount_cents"]),
+                    status,
+                    rule["last_generated_month"] or "-",
+                    rule["note"] or "",
+                ),
+            )
+
+        self.update_picker_options()
+        if update_status:
+            self.set_status(self.t("recurring_refreshed"))
+
+    def selected_recurring_rule(self):
+        selected = self.recurring_tree.selection()
+        if not selected:
+            return None
+
+        rule_id = int(selected[0])
+        return next((rule for rule in self.recurring_rules if rule["id"] == rule_id), None)
+
+    def on_recurring_select(self, event=None):
+        rule = self.selected_recurring_rule()
+        if rule:
+            self.set_status(f"Selected recurring rule #{rule['id']}.")
+
+    def read_recurring_form(self):
+        name = self.recurring_name_var.get().strip()
+        record_type = self.recurring_type_var.get()
+        category = self.recurring_category_var.get().strip()
+        account = self.recurring_account_var.get().strip() or DEFAULT_ACCOUNT
+        amount_cents = amount_to_cents(self.recurring_amount_var.get())
+        note = self.recurring_note_var.get().strip()
+
+        if not name:
+            raise ValueError("Rule name must be non-empty.")
+        if record_type not in TYPE_OPTIONS:
+            raise ValueError("Type must be income or expense.")
+        if not category:
+            raise ValueError("Category must be non-empty.")
+
+        try:
+            day_of_month = int(self.recurring_day_var.get())
+        except ValueError as exc:
+            raise ValueError("Day of month must be a number.") from exc
+        if not 1 <= day_of_month <= 31:
+            raise ValueError("Day of month must be between 1 and 31.")
+
+        return name, record_type, category, account, amount_cents, note, day_of_month, self.recurring_active_var.get()
+
+    def save_recurring_rule(self):
+        try:
+            name, record_type, category, account, amount_cents, note, day_of_month, active = self.read_recurring_form()
+        except ValueError as exc:
+            self.set_status(str(exc))
+            return
+
+        upsert_recurring_rule(
+            name,
+            record_type,
+            category,
+            account,
+            amount_cents,
+            note,
+            day_of_month,
+            active=active,
+            rule_id=self.editing_recurring_id,
+        )
+        self.clear_recurring_form(reset_status=False)
+        self.refresh_all(self.t("recurring_saved"))
+
+    def start_recurring_edit(self):
+        rule = self.selected_recurring_rule()
+        if not rule:
+            self.set_status("Select a recurring rule to edit.")
+            return
+
+        self.editing_recurring_id = rule["id"]
+        self.recurring_name_var.set(rule["name"])
+        self.recurring_day_var.set(str(rule["day_of_month"]))
+        self.recurring_type_var.set(rule["type"])
+        self.recurring_category_var.set(rule["category"])
+        self.recurring_account_var.set(rule["account"])
+        self.recurring_amount_var.set(amount_entry_text(rule["amount_cents"]))
+        self.recurring_note_var.set(rule["note"] or "")
+        self.recurring_active_var.set(bool(rule["active"]))
+        self.recurring_save_button.configure(text=self.t("update_rule"))
+        self.notebook.select(self.recurring_tab)
+        self.set_status(f"Editing recurring rule #{rule['id']}.")
+
+    def clear_recurring_form(self, reset_status=True):
+        self.editing_recurring_id = None
+        self.recurring_name_var.set("")
+        self.recurring_day_var.set(str(date.today().day))
+        self.recurring_type_var.set("expense")
+        self.recurring_category_var.set("")
+        self.recurring_account_var.set(DEFAULT_ACCOUNT)
+        self.recurring_amount_var.set("")
+        self.recurring_note_var.set("")
+        self.recurring_active_var.set(True)
+        self.recurring_save_button.configure(text=self.t("save_rule"))
+        self.recurring_tree.selection_remove(self.recurring_tree.selection())
+        if reset_status:
+            self.set_status(self.t("form_cleared"))
+
+    def delete_selected_recurring_rule(self):
+        rule = self.selected_recurring_rule()
+        if not rule:
+            self.set_status("Select a recurring rule to delete.")
+            return
+
+        confirmed = messagebox.askyesno(
+            "Delete recurring rule",
+            f"Delete recurring rule {rule['name']}?",
+        )
+        if not confirmed:
+            self.set_status("Delete cancelled.")
+            return
+
+        delete_recurring_rule(rule["id"])
+        self.clear_recurring_form(reset_status=False)
+        self.refresh_all(self.t("recurring_deleted"))
+
+    def generate_recurring_now(self):
+        generated = generate_due_recurring_records()
+        self.refresh_all(
+            self.t("recurring_generated", count=generated) if generated else self.t("no_recurring_due")
+        )
+
+    def verify_current_password(self):
+        digest = get_setting("password_hash")
+        salt = get_setting("password_salt")
+        if not digest or not salt:
+            return True
+
+        current = simpledialog.askstring(
+            self.t("current_password"),
+            self.t("password_prompt"),
+            show="*",
+            parent=self.root,
+        )
+        if current is None:
+            return False
+        if verify_password(current, salt, digest):
+            return True
+
+        messagebox.showerror(self.t("password"), self.t("invalid_password"), parent=self.root)
+        return False
+
+    def change_password(self):
+        if not self.verify_current_password():
+            self.set_status(self.t("password_unchanged"))
+            return
+
+        new_password = simpledialog.askstring(
+            self.t("new_password"),
+            self.t("new_password"),
+            show="*",
+            parent=self.root,
+        )
+        if not new_password:
+            self.set_status(self.t("password_unchanged"))
+            return
+        confirm = simpledialog.askstring(
+            self.t("confirm_password"),
+            self.t("confirm_password"),
+            show="*",
+            parent=self.root,
+        )
+        if new_password != confirm:
+            messagebox.showerror(self.t("password"), self.t("password_mismatch"), parent=self.root)
+            self.set_status(self.t("password_unchanged"))
+            return
+
+        salt, digest = hash_password(new_password)
+        set_setting("password_salt", salt)
+        set_setting("password_hash", digest)
+        if hasattr(self, "password_status_var"):
+            self.password_status_var.set(self.t("password_enabled"))
+        self.set_status(self.t("password_saved"))
+
+    def remove_password(self):
+        if not self.has_password():
+            self.set_status(self.t("password_not_enabled"))
+            return
+        if not self.verify_current_password():
+            self.set_status(self.t("password_unchanged"))
+            return
+
+        set_setting("password_salt", "")
+        set_setting("password_hash", "")
+        if hasattr(self, "password_status_var"):
+            self.password_status_var.set(self.t("password_not_enabled"))
+        self.set_status(self.t("password_removed"))
 
     def backup_data(self):
         default_name = f"expense-tracker-backup-{date.today().isoformat()}.db"

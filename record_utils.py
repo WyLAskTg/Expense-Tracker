@@ -64,19 +64,40 @@ def record_signature(record):
         record["date"],
         record["type"],
         record["category"].strip().casefold(),
+        record.get("account", "Cash").strip().casefold(),
         int(record["amount_cents"]),
     )
 
 
-def parse_csv_records(path):
+def csv_headers(path):
+    with open(path, newline="", encoding="utf-8-sig") as csv_file:
+        reader = csv.DictReader(csv_file)
+        if reader.fieldnames is None:
+            raise ValueError("CSV file is missing a header row.")
+        return [name for name in reader.fieldnames if name]
+
+
+def default_csv_mapping(headers):
+    normalized = {header.strip().lower(): header for header in headers}
+    return {
+        "date": normalized.get("date"),
+        "type": normalized.get("type"),
+        "category": normalized.get("category"),
+        "account": normalized.get("account") or normalized.get("payment") or normalized.get("payment method"),
+        "amount": normalized.get("amount"),
+        "note": normalized.get("note") or normalized.get("description"),
+    }
+
+
+def parse_csv_records(path, mapping=None):
     with open(path, newline="", encoding="utf-8-sig") as csv_file:
         reader = csv.DictReader(csv_file)
         if reader.fieldnames is None:
             raise ValueError("CSV file is missing a header row.")
 
-        header_map = {name.strip().lower(): name for name in reader.fieldnames if name}
+        mapping = mapping or default_csv_mapping(reader.fieldnames)
         required = ("date", "type", "category", "amount")
-        missing = [name for name in required if name not in header_map]
+        missing = [name for name in required if not mapping.get(name)]
         if missing:
             raise ValueError(f"CSV is missing required column(s): {', '.join(missing)}.")
 
@@ -84,21 +105,24 @@ def parse_csv_records(path):
         errors = []
         for row_number, row in enumerate(reader, start=2):
             try:
-                record_type = (row[header_map["type"]] or "").strip().lower()
+                record_type = (row[mapping["type"]] or "").strip().lower()
                 if record_type not in TYPE_OPTIONS:
                     raise ValueError("type must be income or expense")
 
-                category = (row[header_map["category"]] or "").strip()
+                category = (row[mapping["category"]] or "").strip()
                 if not category:
                     raise ValueError("category must be non-empty")
 
+                account = (row.get(mapping.get("account") or "", "") or "").strip() or "Cash"
+
                 imported.append(
                     {
-                        "date": parse_record_date(row[header_map["date"]] or ""),
+                        "date": parse_record_date(row[mapping["date"]] or ""),
                         "type": record_type,
                         "category": category,
-                        "amount_cents": amount_to_cents(row[header_map["amount"]] or ""),
-                        "note": (row.get(header_map.get("note", ""), "") or "").strip(),
+                        "account": account,
+                        "amount_cents": amount_to_cents(row[mapping["amount"]] or ""),
+                        "note": (row.get(mapping.get("note") or "", "") or "").strip(),
                     }
                 )
             except ValueError as exc:

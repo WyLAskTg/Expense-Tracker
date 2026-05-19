@@ -4,6 +4,8 @@ from pathlib import Path
 
 from record_utils import (
     amount_to_cents,
+    csv_headers,
+    default_csv_mapping,
     money_text,
     parse_csv_records,
     parse_month,
@@ -28,9 +30,9 @@ class RecordUtilsTest(unittest.TestCase):
 
     def test_csv_parse_and_duplicate_split(self):
         with tempfile.NamedTemporaryFile("w", suffix=".csv", encoding="utf-8", delete=False) as tmp:
-            tmp.write("date,type,category,amount,note\n")
-            tmp.write("2026-05-18,expense,Food,12.34,lunch\n")
-            tmp.write("2026-05-18,expense,Food,12.34,duplicate note\n")
+            tmp.write("date,type,category,account,amount,note\n")
+            tmp.write("2026-05-18,expense,Food,Card,12.34,lunch\n")
+            tmp.write("2026-05-18,expense,Food,Card,12.34,duplicate note\n")
             path = tmp.name
 
         try:
@@ -38,6 +40,31 @@ class RecordUtilsTest(unittest.TestCase):
             new_records, duplicates = split_new_and_duplicate_records(parsed, [])
             self.assertEqual(len(new_records), 1)
             self.assertEqual(len(duplicates), 1)
+            self.assertEqual(parsed[0]["account"], "Card")
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_csv_mapping_supports_custom_headers(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", encoding="utf-8", delete=False) as tmp:
+            tmp.write("When,Kind,Group,Payment,Value,Description\n")
+            tmp.write("2026-05-18,income,Salary,Bank,1000,May pay\n")
+            path = tmp.name
+
+        try:
+            headers = csv_headers(path)
+            mapping = {
+                "date": "When",
+                "type": "Kind",
+                "category": "Group",
+                "account": "Payment",
+                "amount": "Value",
+                "note": "Description",
+            }
+            parsed = parse_csv_records(path, mapping=mapping)
+            self.assertEqual(headers[0], "When")
+            self.assertEqual(default_csv_mapping(["date", "type", "category", "amount"])["date"], "date")
+            self.assertEqual(parsed[0]["account"], "Bank")
+            self.assertEqual(parsed[0]["amount_cents"], 100000)
         finally:
             Path(path).unlink(missing_ok=True)
 
