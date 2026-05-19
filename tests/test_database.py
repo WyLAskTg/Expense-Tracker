@@ -6,22 +6,29 @@ from datetime import date
 from pathlib import Path
 
 from database import (
+    archive_account,
+    cleanup_tags,
     database_init,
     delete_category,
     delete_record,
     delete_transfer,
     decrypt_database,
     encrypt_database,
+    find_duplicate_records,
     generate_due_recurring_records,
     get_accounts,
     get_setting,
     insert_record,
     insert_transfer,
     load_account_balances,
+    load_accounts_detail,
+    load_budget_alerts,
     load_categories,
     load_recurring_rules,
     load_records,
     load_transfers,
+    merge_account_records,
+    merge_category_records,
     restore_record,
     restore_transfer,
     run_auto_backup,
@@ -80,6 +87,54 @@ class DatabaseTest(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["account"], "Card")
 
+    def test_records_support_tags_attachments_and_advanced_filters(self):
+        insert_record(
+            "expense",
+            "Food",
+            1234,
+            "client lunch",
+            "2026-05-18",
+            account="Card",
+            tags="food,work",
+            attachment_path="receipt.pdf",
+        )
+        insert_record("income", "Salary", 200000, "pay", "2026-05-19", account="Bank", tags="pay")
+
+        records = load_records(
+            tag="food",
+            record_type="expense",
+            search="work",
+            date_from="2026-05-01",
+            date_to="2026-05-31",
+            amount_min_cents=1000,
+            amount_max_cents=2000,
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["tags"], "food,work")
+        self.assertEqual(records[0]["attachment_path"], "receipt.pdf")
+
+    def test_account_metadata_and_archive_state_are_saved(self):
+        account_id = save_account(
+            "Credit Card",
+            opening_balance_cents=-5000,
+            account_type="credit",
+            icon="CC",
+            archived=True,
+            sort_order=5,
+        )
+
+        details = {row["name"]: row for row in load_accounts_detail(include_archived=True)}
+
+        self.assertEqual(details["Credit Card"]["type"], "credit")
+        self.assertEqual(details["Credit Card"]["icon"], "CC")
+        self.assertEqual(details["Credit Card"]["sort_order"], 5)
+        self.assertTrue(details["Credit Card"]["archived"])
+        self.assertNotIn("Credit Card", get_accounts())
+
+        archive_account(account_id, archived=False)
+        self.assertIn("Credit Card", get_accounts())
+
     def test_recurring_rules_generate_once_per_month(self):
         upsert_recurring_rule(
             "Rent",
@@ -107,6 +162,14 @@ class DatabaseTest(unittest.TestCase):
         self.assertIsNotNone(first_backup)
         self.assertTrue(Path(first_backup).exists())
         self.assertIsNone(second_backup)
+
+    def test_auto_backup_can_copy_to_custom_folder(self):
+        with tempfile.TemporaryDirectory() as custom_folder:
+            set_setting("auto_backup_folder", custom_folder)
+            backup = run_auto_backup(keep=2, today=date(2026, 5, 17))
+
+            copied = Path(custom_folder) / Path(backup).name
+            self.assertTrue(copied.exists())
 
     def test_account_balances_include_transfers(self):
         save_account("Cash", opening_balance_cents=10000)
@@ -154,6 +217,26 @@ class DatabaseTest(unittest.TestCase):
         self.assertEqual(len(records), 3)
         self.assertEqual(rules[0]["last_generated_date"], "2026-05-15")
         self.assertEqual(rules[0]["next_due_date"], "2026-05-22")
+
+    def test_budget_alerts_and_data_quality_helpers(self):
+        insert_record("expense", "Food", 9000, "lunch", "2026-05-18", account="Card", tags="Food, work,food")
+        insert_record("expense", "Food", 9000, "duplicate", "2026-05-18", account="Card")
+        upsert_budget("2026-05", "Food", 10000)
+
+        alerts = load_budget_alerts("2026-05")
+        duplicates = find_duplicate_records()
+        tag_updates = cleanup_tags()
+        category_counts = merge_category_records("Food", "Meals")
+        account_counts = merge_account_records("Card", "Cash")
+        records = load_records(category="Meals", account="Cash")
+
+        self.assertEqual(alerts[0]["category"], "Food")
+        self.assertGreaterEqual(alerts[0]["usage"], 1)
+        self.assertEqual(duplicates[0]["duplicate_count"], 2)
+        self.assertEqual(tag_updates, 1)
+        self.assertEqual(category_counts["records"], 2)
+        self.assertEqual(account_counts["records"], 2)
+        self.assertEqual(len(records), 2)
 
     def test_database_encryption_round_trip(self):
         insert_record("expense", "Food", 1234, "lunch", "2026-05-18", account="Cash")

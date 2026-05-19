@@ -30,9 +30,9 @@ class RecordUtilsTest(unittest.TestCase):
 
     def test_csv_parse_and_duplicate_split(self):
         with tempfile.NamedTemporaryFile("w", suffix=".csv", encoding="utf-8", delete=False) as tmp:
-            tmp.write("date,type,category,account,amount,note\n")
-            tmp.write("2026-05-18,expense,Food,Card,12.34,lunch\n")
-            tmp.write("2026-05-18,expense,Food,Card,12.34,duplicate note\n")
+            tmp.write("date,type,category,account,tags,amount,attachment_path,note\n")
+            tmp.write("2026-05-18,expense,Food,Card,food,12.34,receipt.pdf,lunch\n")
+            tmp.write("2026-05-18,expense,Food,Card,food,12.34,receipt.pdf,duplicate note\n")
             path = tmp.name
 
         try:
@@ -41,6 +41,8 @@ class RecordUtilsTest(unittest.TestCase):
             self.assertEqual(len(new_records), 1)
             self.assertEqual(len(duplicates), 1)
             self.assertEqual(parsed[0]["account"], "Card")
+            self.assertEqual(parsed[0]["tags"], "food")
+            self.assertEqual(parsed[0]["attachment_path"], "receipt.pdf")
         finally:
             Path(path).unlink(missing_ok=True)
 
@@ -62,7 +64,10 @@ class RecordUtilsTest(unittest.TestCase):
             }
             parsed = parse_csv_records(path, mapping=mapping)
             self.assertEqual(headers[0], "When")
-            self.assertEqual(default_csv_mapping(["date", "type", "category", "amount"])["date"], "date")
+            default_mapping = default_csv_mapping(["date", "type", "category", "amount", "tag", "receipt"])
+            self.assertEqual(default_mapping["date"], "date")
+            self.assertEqual(default_mapping["tags"], "tag")
+            self.assertEqual(default_mapping["attachment_path"], "receipt")
             self.assertEqual(parsed[0]["account"], "Bank")
             self.assertEqual(parsed[0]["amount_cents"], 100000)
         finally:

@@ -86,6 +86,8 @@ def default_csv_mapping(headers):
         "account": normalized.get("account") or normalized.get("payment") or normalized.get("payment method"),
         "amount": normalized.get("amount"),
         "note": normalized.get("note") or normalized.get("description"),
+        "tags": normalized.get("tags") or normalized.get("tag"),
+        "attachment_path": normalized.get("attachment") or normalized.get("attachment_path") or normalized.get("receipt"),
     }
 
 
@@ -114,6 +116,8 @@ def parse_csv_records(path, mapping=None):
                     raise ValueError("category must be non-empty")
 
                 account = (row.get(mapping.get("account") or "", "") or "").strip() or "Cash"
+                tags = (row.get(mapping.get("tags") or "", "") or "").strip()
+                attachment_path = (row.get(mapping.get("attachment_path") or "", "") or "").strip()
 
                 imported.append(
                     {
@@ -123,6 +127,8 @@ def parse_csv_records(path, mapping=None):
                         "account": account,
                         "amount_cents": amount_to_cents(row[mapping["amount"]] or ""),
                         "note": (row.get(mapping.get("note") or "", "") or "").strip(),
+                        "tags": tags,
+                        "attachment_path": attachment_path,
                     }
                 )
             except ValueError as exc:

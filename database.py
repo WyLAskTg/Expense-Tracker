@@ -165,6 +165,19 @@ def _migrate_accounts_table(cursor):
     columns = _columns_for_table(cursor, "Accounts")
     if "opening_balance_cents" not in columns:
         cursor.execute("ALTER TABLE Accounts ADD COLUMN opening_balance_cents INTEGER NOT NULL DEFAULT 0")
+    if "type" not in columns:
+        cursor.execute("ALTER TABLE Accounts ADD COLUMN type TEXT NOT NULL DEFAULT 'asset'")
+    if "icon" not in columns:
+        cursor.execute("ALTER TABLE Accounts ADD COLUMN icon TEXT NOT NULL DEFAULT ''")
+    if "archived" not in columns:
+        cursor.execute("ALTER TABLE Accounts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+    if "sort_order" not in columns:
+        cursor.execute("ALTER TABLE Accounts ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+
+    cursor.execute("UPDATE Accounts SET type = 'asset' WHERE type IS NULL OR TRIM(type) = ''")
+    cursor.execute("UPDATE Accounts SET icon = '' WHERE icon IS NULL")
+    cursor.execute("UPDATE Accounts SET archived = 0 WHERE archived IS NULL")
+    cursor.execute("UPDATE Accounts SET sort_order = 0 WHERE sort_order IS NULL")
 
 
 def _migrate_transfers_table(cursor):
@@ -215,6 +228,10 @@ def _migrate_records_table(cursor):
         cursor.execute("ALTER TABLE Records ADD COLUMN updated_at TEXT")
     if "account" not in columns:
         cursor.execute("ALTER TABLE Records ADD COLUMN account TEXT")
+    if "tags" not in columns:
+        cursor.execute("ALTER TABLE Records ADD COLUMN tags TEXT")
+    if "attachment_path" not in columns:
+        cursor.execute("ALTER TABLE Records ADD COLUMN attachment_path TEXT")
 
     today = _today()
     now = _now()
@@ -227,6 +244,8 @@ def _migrate_records_table(cursor):
         """
     )
     cursor.execute("UPDATE Records SET note = '' WHERE note IS NULL")
+    cursor.execute("UPDATE Records SET tags = '' WHERE tags IS NULL")
+    cursor.execute("UPDATE Records SET attachment_path = '' WHERE attachment_path IS NULL")
     cursor.execute(
         "UPDATE Records SET account = ? WHERE account IS NULL OR TRIM(account) = ''",
         (DEFAULT_ACCOUNT,),
@@ -255,6 +274,8 @@ def database_init():
                 amount REAL NOT NULL,
                 amount_cents INTEGER NOT NULL,
                 note TEXT,
+                tags TEXT,
+                attachment_path TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -292,6 +313,10 @@ def database_init():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
                 opening_balance_cents INTEGER NOT NULL DEFAULT 0,
+                type TEXT NOT NULL DEFAULT 'asset',
+                icon TEXT NOT NULL DEFAULT '',
+                archived INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -370,6 +395,8 @@ def insert_record(
     note,
     record_date,
     account=DEFAULT_ACCOUNT,
+    tags="",
+    attachment_path="",
     record_id=None,
 ):
     _validate_type(record_type)
@@ -383,8 +410,8 @@ def insert_record(
             cursor.execute(
                 """
                 INSERT INTO Records
-                    (date, type, category, account, amount, amount_cents, note, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (date, type, category, account, amount, amount_cents, note, tags, attachment_path, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record_date,
@@ -394,6 +421,8 @@ def insert_record(
                     amount_cents / 100,
                     amount_cents,
                     note,
+                    tags or "",
+                    attachment_path or "",
                     now,
                     now,
                 ),
@@ -402,8 +431,8 @@ def insert_record(
             cursor.execute(
                 """
                 INSERT INTO Records
-                    (id, date, type, category, account, amount, amount_cents, note, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, date, type, category, account, amount, amount_cents, note, tags, attachment_path, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record_id,
@@ -414,6 +443,8 @@ def insert_record(
                     amount_cents / 100,
                     amount_cents,
                     note,
+                    tags or "",
+                    attachment_path or "",
                     now,
                     now,
                 ),
@@ -422,7 +453,17 @@ def insert_record(
         return cursor.lastrowid
 
 
-def update_record(record_id, record_type, category, amount_cents, note, record_date, account=DEFAULT_ACCOUNT):
+def update_record(
+    record_id,
+    record_type,
+    category,
+    amount_cents,
+    note,
+    record_date,
+    account=DEFAULT_ACCOUNT,
+    tags="",
+    attachment_path="",
+):
     _validate_type(record_type)
 
     with _connect() as db:
@@ -439,6 +480,8 @@ def update_record(record_id, record_type, category, amount_cents, note, record_d
                 amount = ?,
                 amount_cents = ?,
                 note = ?,
+                tags = ?,
+                attachment_path = ?,
                 updated_at = ?
             WHERE id = ?
             """,
@@ -450,6 +493,8 @@ def update_record(record_id, record_type, category, amount_cents, note, record_d
                 amount_cents / 100,
                 amount_cents,
                 note,
+                tags or "",
+                attachment_path or "",
                 _now(),
                 record_id,
             ),
@@ -458,7 +503,18 @@ def update_record(record_id, record_type, category, amount_cents, note, record_d
         return cursor.rowcount
 
 
-def load_records(month=None, category=None, account=None, search=None):
+def load_records(
+    month=None,
+    category=None,
+    account=None,
+    tag=None,
+    record_type=None,
+    search=None,
+    date_from=None,
+    date_to=None,
+    amount_min_cents=None,
+    amount_max_cents=None,
+):
     clauses = []
     params = []
 
@@ -471,9 +527,27 @@ def load_records(month=None, category=None, account=None, search=None):
     if account:
         clauses.append("account = ?")
         params.append(account)
+    if tag:
+        clauses.append("(',' || tags || ',') LIKE ?")
+        params.append(f"%,{tag},%")
+    if record_type:
+        clauses.append("type = ?")
+        params.append(record_type)
+    if date_from:
+        clauses.append("date >= ?")
+        params.append(date_from)
+    if date_to:
+        clauses.append("date <= ?")
+        params.append(date_to)
+    if amount_min_cents is not None:
+        clauses.append("amount_cents >= ?")
+        params.append(amount_min_cents)
+    if amount_max_cents is not None:
+        clauses.append("amount_cents <= ?")
+        params.append(amount_max_cents)
     if search:
-        clauses.append("(category LIKE ? OR account LIKE ? OR note LIKE ?)")
-        params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+        clauses.append("(category LIKE ? OR account LIKE ? OR tags LIKE ? OR note LIKE ?)")
+        params.extend([f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%"])
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
@@ -481,7 +555,7 @@ def load_records(month=None, category=None, account=None, search=None):
         cursor = db.cursor()
         cursor.execute(
             f"""
-            SELECT id, date, type, category, account, amount_cents, note, created_at, updated_at
+            SELECT id, date, type, category, account, amount_cents, note, tags, attachment_path, created_at, updated_at
             FROM Records
             {where}
             ORDER BY date DESC, id DESC
@@ -506,39 +580,64 @@ def get_categories():
         return [row["name"] for row in cursor.fetchall()]
 
 
-def get_accounts():
+def get_accounts(include_archived=False):
     with _connect() as db:
         cursor = db.cursor()
         _sync_accounts(cursor)
         db.commit()
+        where = "" if include_archived else "WHERE archived = 0"
         cursor.execute(
-            """
+            f"""
             SELECT name
             FROM Accounts
-            ORDER BY name COLLATE NOCASE
+            {where}
+            ORDER BY sort_order, name COLLATE NOCASE
             """
         )
         return [row["name"] for row in cursor.fetchall()]
 
 
-def save_account(name, opening_balance_cents=None, account_id=None):
+def save_account(
+    name,
+    opening_balance_cents=None,
+    account_id=None,
+    account_type="asset",
+    icon="",
+    archived=False,
+    sort_order=0,
+):
     name = (name or DEFAULT_ACCOUNT).strip()
     if not name:
         raise ValueError("Account name must be non-empty.")
+    account_type = (account_type or "asset").strip() or "asset"
+    if account_type not in {"asset", "liability", "credit"}:
+        raise ValueError("Account type must be asset, liability, or credit.")
     now = _now()
     with _connect() as db:
         cursor = db.cursor()
         if account_id is None:
             _ensure_account(cursor, name)
-            if opening_balance_cents is not None:
-                cursor.execute(
-                    """
-                    UPDATE Accounts
-                    SET opening_balance_cents = ?, updated_at = ?
-                    WHERE name = ?
-                    """,
-                    (opening_balance_cents, now, name),
-                )
+            cursor.execute(
+                """
+                UPDATE Accounts
+                SET opening_balance_cents = COALESCE(?, opening_balance_cents),
+                    type = ?,
+                    icon = ?,
+                    archived = ?,
+                    sort_order = ?,
+                    updated_at = ?
+                WHERE name = ?
+                """,
+                (
+                    opening_balance_cents,
+                    account_type,
+                    icon or "",
+                    1 if archived else 0,
+                    int(sort_order or 0),
+                    now,
+                    name,
+                ),
+            )
             db.commit()
             cursor.execute("SELECT id FROM Accounts WHERE name = ?", (name,))
             return cursor.fetchone()["id"]
@@ -555,10 +654,23 @@ def save_account(name, opening_balance_cents=None, account_id=None):
                 UPDATE Accounts
                 SET name = ?,
                     opening_balance_cents = COALESCE(?, opening_balance_cents),
+                    type = ?,
+                    icon = ?,
+                    archived = ?,
+                    sort_order = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (name, opening_balance_cents, now, account_id),
+                (
+                    name,
+                    opening_balance_cents,
+                    account_type,
+                    icon or "",
+                    1 if archived else 0,
+                    int(sort_order or 0),
+                    now,
+                    account_id,
+                ),
             )
             cursor.execute("UPDATE Records SET account = ? WHERE account = ?", (name, old_name))
             cursor.execute("UPDATE RecurringRules SET account = ? WHERE account = ?", (name, old_name))
@@ -571,24 +683,30 @@ def save_account(name, opening_balance_cents=None, account_id=None):
         return account_id
 
 
-def load_accounts_detail():
+def load_accounts_detail(include_archived=True):
     with _connect() as db:
         cursor = db.cursor()
         _sync_accounts(cursor)
         db.commit()
+        where = "" if include_archived else "WHERE Accounts.archived = 0"
         cursor.execute(
-            """
+            f"""
             SELECT
                 Accounts.id,
                 Accounts.name,
                 Accounts.opening_balance_cents,
+                Accounts.type,
+                Accounts.icon,
+                Accounts.archived,
+                Accounts.sort_order,
                 COALESCE(SUM(CASE WHEN Records.type = 'income' THEN Records.amount_cents ELSE 0 END), 0) AS income_cents,
                 COALESCE(SUM(CASE WHEN Records.type = 'expense' THEN Records.amount_cents ELSE 0 END), 0) AS expense_cents,
                 COUNT(Records.id) AS record_count
             FROM Accounts
             LEFT JOIN Records ON Records.account = Accounts.name
+            {where}
             GROUP BY Accounts.id, Accounts.name, Accounts.opening_balance_cents
-            ORDER BY Accounts.name COLLATE NOCASE
+            ORDER BY Accounts.archived, Accounts.sort_order, Accounts.name COLLATE NOCASE
             """
         )
         accounts = [dict(row) for row in cursor.fetchall()]
@@ -625,7 +743,18 @@ def load_accounts_detail():
 
 
 def load_account_balances():
-    return load_accounts_detail()
+    return load_accounts_detail(include_archived=False)
+
+
+def archive_account(account_id, archived=True):
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute(
+            "UPDATE Accounts SET archived = ?, updated_at = ? WHERE id = ?",
+            (1 if archived else 0, _now(), account_id),
+        )
+        db.commit()
+        return cursor.rowcount
 
 
 def insert_transfer(transfer_date, from_account, to_account, amount_cents, note=""):
@@ -940,6 +1069,23 @@ def load_budget_progress(month):
         return [dict(row) for row in cursor.fetchall()]
 
 
+def load_budget_alerts(month, threshold=0.8):
+    alerts = []
+    for row in load_budget_progress(month):
+        budget = int(row["budget_cents"] or 0)
+        spent = int(row["spent_cents"] or 0)
+        if not budget:
+            continue
+        usage = spent / budget
+        if usage >= threshold:
+            item = dict(row)
+            item["usage"] = usage
+            item["status"] = "over" if usage >= 1 else "near"
+            alerts.append(item)
+    alerts.sort(key=lambda item: item["usage"], reverse=True)
+    return alerts
+
+
 def load_budgets(month=None):
     clauses = []
     params = []
@@ -1013,8 +1159,83 @@ def restore_record(record):
         record.get("note") or "",
         record["date"],
         account=record.get("account") or DEFAULT_ACCOUNT,
+        tags=record.get("tags") or "",
+        attachment_path=record.get("attachment_path") or "",
         record_id=record.get("id"),
     )
+
+
+def find_duplicate_records():
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute(
+            """
+            SELECT date, type, category, account, amount_cents, COUNT(*) AS duplicate_count
+            FROM Records
+            GROUP BY date, type, category, account, amount_cents
+            HAVING COUNT(*) > 1
+            ORDER BY duplicate_count DESC, date DESC
+            """
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def merge_category_records(source_category, target_category):
+    source_category = source_category.strip()
+    target_category = target_category.strip()
+    if not source_category or not target_category:
+        raise ValueError("Category names must be non-empty.")
+    with _connect() as db:
+        cursor = db.cursor()
+        _ensure_category(cursor, target_category)
+        cursor.execute("UPDATE Records SET category = ?, updated_at = ? WHERE category = ?", (target_category, _now(), source_category))
+        record_count = cursor.rowcount
+        cursor.execute("UPDATE Budgets SET category = ?, updated_at = ? WHERE category = ?", (target_category, _now(), source_category))
+        budget_count = cursor.rowcount
+        cursor.execute("UPDATE RecurringRules SET category = ?, updated_at = ? WHERE category = ?", (target_category, _now(), source_category))
+        rule_count = cursor.rowcount
+        db.commit()
+        return {"records": record_count, "budgets": budget_count, "rules": rule_count}
+
+
+def merge_account_records(source_account, target_account):
+    source_account = source_account.strip()
+    target_account = target_account.strip()
+    if not source_account or not target_account:
+        raise ValueError("Account names must be non-empty.")
+    with _connect() as db:
+        cursor = db.cursor()
+        _ensure_account(cursor, target_account)
+        cursor.execute("UPDATE Records SET account = ?, updated_at = ? WHERE account = ?", (target_account, _now(), source_account))
+        record_count = cursor.rowcount
+        cursor.execute("UPDATE RecurringRules SET account = ?, updated_at = ? WHERE account = ?", (target_account, _now(), source_account))
+        rule_count = cursor.rowcount
+        cursor.execute("UPDATE Transfers SET from_account = ?, updated_at = ? WHERE from_account = ?", (target_account, _now(), source_account))
+        transfer_from_count = cursor.rowcount
+        cursor.execute("UPDATE Transfers SET to_account = ?, updated_at = ? WHERE to_account = ?", (target_account, _now(), source_account))
+        transfer_to_count = cursor.rowcount
+        db.commit()
+        return {
+            "records": record_count,
+            "rules": rule_count,
+            "transfers": transfer_from_count + transfer_to_count,
+        }
+
+
+def cleanup_tags():
+    updated = 0
+    with _connect() as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT id, tags FROM Records WHERE tags IS NOT NULL AND TRIM(tags) != ''")
+        rows = cursor.fetchall()
+        for row in rows:
+            tags = sorted({tag.strip().lower() for tag in row["tags"].split(",") if tag.strip()})
+            cleaned = ",".join(tags)
+            if cleaned != row["tags"]:
+                cursor.execute("UPDATE Records SET tags = ?, updated_at = ? WHERE id = ?", (cleaned, _now(), row["id"]))
+                updated += 1
+        db.commit()
+    return updated
 
 
 def _parse_date(value):
@@ -1294,6 +1515,12 @@ def run_auto_backup(keep=7, today=None):
     backup_dir.mkdir(parents=True, exist_ok=True)
     destination = backup_dir / f"expense-tracker-auto-{today_text}.db"
     shutil.copy2(get_db_path(), destination)
+
+    custom_backup_folder = get_setting("auto_backup_folder")
+    if custom_backup_folder:
+        custom_dir = Path(custom_backup_folder).expanduser().resolve()
+        custom_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(get_db_path(), custom_dir / destination.name)
 
     backups = sorted(backup_dir.glob("expense-tracker-auto-*.db"), key=lambda path: path.stat().st_mtime)
     for old_backup in backups[:-keep]:
